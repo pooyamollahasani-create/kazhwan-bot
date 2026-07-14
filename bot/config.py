@@ -16,6 +16,15 @@ class Settings:
     support_contact: str
     group_chat_id: int | None
 
+def _normalize_database_url(url: str) -> str:
+    """Convert Railway PostgreSQL URLs to SQLAlchemy asyncpg URLs."""
+    value = url.strip()
+    if value.startswith("postgres://"):
+        return value.replace("postgres://", "postgresql+asyncpg://", 1)
+    if value.startswith("postgresql://"):
+        return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+    return value
+
 def load_settings() -> Settings:
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
@@ -24,9 +33,9 @@ def load_settings() -> Settings:
     group_raw = os.getenv("GROUP_CHAT_ID", "").strip()
     return Settings(
         bot_token=token,
-        database_url=os.getenv(
-            "DATABASE_URL", "sqlite+aiosqlite:///./kazhwan.db"
-        ).strip(),
+        database_url=_normalize_database_url(
+            os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./kazhwan.db")
+        ),
         channel_username=os.getenv(
             "CHANNEL_USERNAME", "@Kazhwantravel"
         ).strip(),

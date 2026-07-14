@@ -67,3 +67,28 @@ python -m bot.main
 ## مرحله بعد
 
 بعد از تست ثبت عضویت، ماژول برنامه‌ها، ثبت‌نام، ظرفیت و لیست انتظار به همین پروژه اضافه می‌شود.
+
+
+---
+
+## استقرار روی Railway
+
+این نسخه برای Railway آماده است. دستور اجرا:
+
+```text
+python -m bot.main
+```
+
+در تب **Variables** سرویس ربات این متغیرها را وارد کنید:
+
+```text
+BOT_TOKEN=توکن جدید ربات
+CHANNEL_USERNAME=@Kazhwantravel
+ADMIN_IDS=86054420
+SUPPORT_CONTACT=@Kazhwantravel
+GROUP_CHAT_ID=
+```
+
+برای دیتابیس دائمی، در Railway از مسیر **+ New → Database → PostgreSQL** یک دیتابیس اضافه کنید و متغیر `DATABASE_URL` آن را در اختیار سرویس ربات قرار دهید. کد، آدرس PostgreSQL Railway را خودکار به قالب asyncpg تبدیل می‌کند.
+
+فایل `.env` را در GitHub آپلود نکنید.
