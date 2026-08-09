@@ -15,6 +15,8 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"شماره تماس: {user.phone}\n"
         f"شهر: {user.city}\n"
         f"شناسه عضویت: {user.member_code}\n"
+        f"کد معرف: {user.referral_code or '-'}\n"
+        f"تعداد معرفی موفق: {user.referral_count}\n"
         f"امتیاز: {user.points}\n"
         f"وضعیت: {user.status}",
         reply_markup=main_menu(),
@@ -45,6 +47,7 @@ async def card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🎖 کارت عضویت کژوان\n\n"
         f"نام: {user.full_name}\n"
         f"شناسه: {user.member_code}\n"
+        f"کد معرف: {user.referral_code or '-'}\n"
         f"شهر: {user.city}\n"
         f"سطح: تازه‌وارد\n"
         f"امتیاز: {user.points}"
