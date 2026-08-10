@@ -106,6 +106,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     db = context.application.bot_data["db"]
     user = await db.get_user(update.effective_user.id)
     if user:
+        settings = context.application.bot_data["settings"]
+        if settings.group_chat_id:
+            try:
+                member = await context.bot.get_chat_member(settings.group_chat_id, user.telegram_id)
+                if member.status in {
+                    ChatMemberStatus.MEMBER,
+                    ChatMemberStatus.ADMINISTRATOR,
+                    ChatMemberStatus.OWNER,
+                }:
+                    await db.mark_existing_group_member(user.telegram_id)
+                    await db.ensure_member_activity(
+                        user.telegram_id, user.telegram_username, user.full_name
+                    )
+            except Exception:
+                logger.exception("Could not check existing member status on /start")
         await update.message.reply_text(
             f"سلام {user.full_name} 🌿",
             reply_markup=main_menu(),
@@ -327,6 +342,7 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
                 user_id=tg_user.id,
             )
             await db.mark_group_approved_and_reward_referrer(tg_user.id)
+            await db.ensure_member_activity(tg_user.id, tg_user.username, user.full_name)
             await db.delete_pending_join(tg_user.id)
             approved = True
         except Exception:
@@ -347,12 +363,37 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"کد معرف اختصاصی شما: {user.referral_code}"
         )
     else:
-        message = (
-            "🎉 پروفایل شما با موفقیت ثبت شد.\n\n"
-            f"شناسه عضویت: {user.member_code}\n"
-            f"کد معرف اختصاصی شما: {user.referral_code}\n"
-            "اگر درخواست عضویت گروه را ارسال کنید، ربات می‌تواند آن را پس از بررسی تأیید کند."
-        )
+        # Existing group members can register directly in PV without a Join Request.
+        settings = context.application.bot_data["settings"]
+        already_in_group = False
+        if settings.group_chat_id:
+            try:
+                member = await context.bot.get_chat_member(settings.group_chat_id, tg_user.id)
+                already_in_group = member.status in {
+                    ChatMemberStatus.MEMBER,
+                    ChatMemberStatus.ADMINISTRATOR,
+                    ChatMemberStatus.OWNER,
+                }
+            except Exception:
+                logger.exception("Could not check group membership after registration")
+
+        if already_in_group:
+            await db.mark_existing_group_member(tg_user.id)
+            await db.ensure_member_activity(
+                tg_user.id, tg_user.username, user.full_name
+            )
+            message = (
+                "✅ اطلاعات شما با موفقیت ثبت شد.\n\n"
+                f"شناسه عضویت: {user.member_code}\n"
+                f"کد معرف اختصاصی شما: {user.referral_code}"
+            )
+        else:
+            message = (
+                "🎉 پروفایل شما با موفقیت ثبت شد.\n\n"
+                f"شناسه عضویت: {user.member_code}\n"
+                f"کد معرف اختصاصی شما: {user.referral_code}\n"
+                "اگر درخواست عضویت گروه را ارسال کنید، ربات می‌تواند آن را پس از بررسی تأیید کند."
+            )
 
     if update.callback_query:
         await update.callback_query.message.reply_text(message, reply_markup=main_menu())

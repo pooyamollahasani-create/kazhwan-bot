@@ -1,9 +1,9 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, Text, func, inspect, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-REFERRAL_REWARD_POINTS = 10
+REFERRAL_REWARD_POINTS = 5
 
 
 class Base(DeclarativeBase):
@@ -59,6 +59,27 @@ class PendingJoin(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+
+
+class MemberActivity(Base):
+    __tablename__ = "member_activity"
+
+    telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    telegram_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    display_name: Mapped[str] = mapped_column(String(160))
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    last_activity_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
+    )
+
+
+class GroupModerationState(Base):
+    __tablename__ = "group_moderation_state"
+
+    group_chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    saved_permissions_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Database:
@@ -234,6 +255,100 @@ class Database:
             await session.commit()
             await session.refresh(user)
             return user
+
+    async def touch_member_activity(
+        self, telegram_id: int, username: str | None, display_name: str
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        async with self.sessions() as session:
+            activity = await session.get(MemberActivity, telegram_id)
+            if activity:
+                activity.telegram_username = username
+                activity.display_name = display_name
+                activity.last_activity_at = now
+            else:
+                session.add(
+                    MemberActivity(
+                        telegram_id=telegram_id,
+                        telegram_username=username,
+                        display_name=display_name,
+                        first_seen_at=now,
+                        last_activity_at=now,
+                    )
+                )
+
+            result = await session.execute(
+                select(User).where(User.telegram_id == telegram_id)
+            )
+            user = result.scalar_one_or_none()
+            if user:
+                user.last_activity_at = now
+            await session.commit()
+
+    async def ensure_member_activity(
+        self, telegram_id: int, username: str | None, display_name: str
+    ) -> None:
+        async with self.sessions() as session:
+            activity = await session.get(MemberActivity, telegram_id)
+            if not activity:
+                now = datetime.now(timezone.utc)
+                session.add(
+                    MemberActivity(
+                        telegram_id=telegram_id,
+                        telegram_username=username,
+                        display_name=display_name,
+                        first_seen_at=now,
+                        last_activity_at=now,
+                    )
+                )
+                await session.commit()
+
+    async def list_inactive_members(self, days: int, limit: int = 100) -> list[MemberActivity]:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(MemberActivity)
+                .where(MemberActivity.last_activity_at <= cutoff)
+                .order_by(MemberActivity.last_activity_at.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def mark_existing_group_member(self, telegram_id: int) -> None:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(User).where(User.telegram_id == telegram_id)
+            )
+            user = result.scalar_one_or_none()
+            if user and not user.group_approved:
+                user.group_approved = True
+                await session.commit()
+
+    async def get_saved_group_permissions(self, group_chat_id: int) -> str | None:
+        async with self.sessions() as session:
+            state = await session.get(GroupModerationState, group_chat_id)
+            return state.saved_permissions_json if state else None
+
+    async def save_group_permissions(self, group_chat_id: int, permissions_json: str) -> None:
+        async with self.sessions() as session:
+            state = await session.get(GroupModerationState, group_chat_id)
+            if state:
+                state.saved_permissions_json = permissions_json
+            else:
+                session.add(
+                    GroupModerationState(
+                        group_chat_id=group_chat_id,
+                        saved_permissions_json=permissions_json,
+                    )
+                )
+            await session.commit()
+
+    async def clear_group_permissions(self, group_chat_id: int) -> None:
+        async with self.sessions() as session:
+            state = await session.get(GroupModerationState, group_chat_id)
+            if state:
+                state.saved_permissions_json = None
+                await session.commit()
 
     async def list_activities(self, telegram_id: int, limit: int = 15) -> list[Activity]:
         async with self.sessions() as session:
