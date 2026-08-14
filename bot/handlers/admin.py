@@ -7,6 +7,8 @@ from telegram.constants import ChatType
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from bot.utils.xlsx import build_xlsx
+from sqlalchemy import select
+from bot.db import Trip
 
 
 STATUS_LABELS = {
@@ -29,6 +31,23 @@ TRIP_STATUS_LABELS = {
 def is_admin(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     settings = context.application.bot_data["settings"]
     return user_id in settings.admin_ids
+
+
+async def _list_trips_compat(db, limit: int = 30):
+    """v1.4.6 compatibility path.
+
+    Some Railway deployments retained an older Database class without
+    list_trips().  The admin panel can query through the existing session
+    factory directly, so trip management remains usable even in that case.
+    """
+    method = getattr(db, "list_trips", None)
+    if callable(method):
+        return await method(limit=limit)
+    async with db.sessions() as session:
+        result = await session.execute(
+            select(Trip).order_by(Trip.created_at.desc()).limit(limit)
+        )
+        return list(result.scalars().all())
 
 
 def _admin_keyboard() -> InlineKeyboardMarkup:
@@ -380,7 +399,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "memberhelp":
         await query.message.reply_text("🔎 جستجوی عضو:\n/member نام یا شماره یا کد عضویت")
     elif action == "trips":
-        trips = await context.application.bot_data["db"].list_trips(limit=30)
+        trips = await _list_trips_compat(context.application.bot_data["db"], limit=30)
         if not trips:
             await query.message.reply_text("هنوز سفری ثبت نشده است.", reply_markup=_back_admin_keyboard())
         else:
