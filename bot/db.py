@@ -477,7 +477,6 @@ class Database:
         self, telegram_id: int, username: str | None, display_name: str
     ) -> None:
         now = datetime.now(timezone.utc)
-        points_value = TRIP_POINTS.get(trip_type, 0)
         async with self.sessions() as session:
             activity = await session.get(MemberActivity, telegram_id)
             if activity:
@@ -716,6 +715,13 @@ class Database:
         async with self.sessions() as session:
             return await session.get(Trip, trip_id)
 
+    async def list_trips(self, limit: int = 100) -> list[Trip]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(Trip).order_by(Trip.created_at.desc()).limit(limit)
+            )
+            return list(result.scalars().all())
+
     async def set_trip_status(self, trip_id: int, status: str) -> Trip | None:
         async with self.sessions() as session:
             trip = await session.get(Trip, trip_id)
@@ -771,15 +777,16 @@ class Database:
             participant = await session.get(TripParticipant, (trip_id, telegram_id))
             if not participant:
                 return None
-            participant.status = status
-            participant.updated_at = datetime.now(timezone.utc)
+
             trip = await session.get(Trip, trip_id)
-            if trip and status == "attended":
-                user_result = await session.execute(
-                    select(User).where(User.telegram_id == telegram_id)
-                )
-                user = user_result.scalar_one_or_none()
-                if user and not participant.points_awarded:
+            user_result = await session.execute(
+                select(User).where(User.telegram_id == telegram_id)
+            )
+            user = user_result.scalar_one_or_none()
+
+            # Reversible and idempotent points: only attended earns points.
+            if status == "attended":
+                if trip and user and not participant.points_awarded:
                     points = int(trip.points_value or TRIP_POINTS.get(trip.trip_type, 0))
                     user.points += points
                     participant.points_awarded = True
@@ -792,24 +799,17 @@ class Database:
                             details=f"{trip.trip_code} | +{points} امتیاز",
                         )
                     )
-                else:
-                    check = await session.execute(
-                        select(Activity).where(
-                            Activity.telegram_id == telegram_id,
-                            Activity.activity_type == "trip_attended",
-                            Activity.title == f"شرکت در سفر {trip.title}",
-                        )
-                    )
-                    if check.scalar_one_or_none() is None:
-                        session.add(
-                            Activity(
-                                telegram_id=telegram_id,
-                                activity_type="trip_attended",
-                                title=f"شرکت در سفر {trip.title}",
-                                details=trip.trip_code,
-                            )
-                        )
+            elif participant.points_awarded:
+                # If an admin corrects an attended status, remove the previously-awarded trip points.
+                if user:
+                    user.points = max(0, user.points - int(participant.awarded_points or 0))
+                participant.points_awarded = False
+                participant.awarded_points = 0
+
+            participant.status = status
+            participant.updated_at = datetime.now(timezone.utc)
             await session.commit()
+            await session.refresh(participant)
             return participant
 
 
