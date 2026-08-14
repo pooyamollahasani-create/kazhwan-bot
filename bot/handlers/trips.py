@@ -242,133 +242,44 @@ async def tripchannel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await _register_trip_after_channel(query, context, trip_id)
 
 
+async def _management_in_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id, context):
+        return
+    me = await context.bot.get_me()
+    await update.effective_message.reply_text(
+        "🔐 مدیریت مسافران، تأیید حضور، انصراف، خروجی Excel و پایان سفر "
+        "از پنل خصوصی ربات انجام می‌شود.\n\n"
+        f"وارد PV شوید و /admin را بزنید:\nhttps://t.me/{me.username}?start=admin"
+    )
+
+
 async def tripparticipants(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id, context) or not _is_group(update):
-        return
-    db = context.application.bot_data["db"]
-    trip = await db.get_trip_by_chat_id(update.effective_chat.id)
-    if not trip:
-        await update.effective_message.reply_text("این گروه به سفری متصل نیست.")
-        return
-    rows = await db.list_trip_participants(trip.id)
-    if not rows:
-        await update.effective_message.reply_text("هنوز کسی این سفر را در پروفایل خود ثبت نکرده است.")
-        return
-    lines = [f"👥 مسافران ثبت‌شده — {trip.title}", ""]
-    for idx, (participant, user) in enumerate(rows, 1):
-        name = user.full_name if user else str(participant.telegram_id)
-        lines.append(f"{idx}. {name} — {STATUS_LABELS.get(participant.status, participant.status)}")
-    await update.effective_message.reply_text("\n".join(lines[:100]))
+    await _management_in_private(update, context)
 
 
 async def exporttrip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id, context) or not _is_group(update):
-        return
-    db = context.application.bot_data["db"]
-    trip = await db.get_trip_by_chat_id(update.effective_chat.id)
-    if not trip:
-        await update.effective_message.reply_text("این گروه به سفری متصل نیست.")
-        return
-    items = await db.list_trip_participants(trip.id)
-    headers = [
-        "نام", "شماره تماس", "شهر", "Username", "Telegram ID", "کد عضویت",
-        "وضعیت", "تاریخ اعلام حضور", "نام سفر", "نوع سفر", "امتیاز سفر",
-        "امتیاز اعطاشده", "کد سفر",
-    ]
-    rows = []
-    for participant, user in items:
-        rows.append([
-            user.full_name if user else "",
-            user.phone if user else "",
-            user.city if user else "",
-            f"@{user.telegram_username}" if user and user.telegram_username else "",
-            participant.telegram_id,
-            user.member_code if user else "",
-            STATUS_LABELS.get(participant.status, participant.status),
-            participant.declared_at.isoformat() if participant.declared_at else "",
-            trip.title,
-            _trip_type_label(trip.trip_type),
-            trip.points_value,
-            participant.awarded_points,
-            trip.trip_code,
-        ])
-    file_obj = build_xlsx(headers, rows, sheet_name="Trip")
-    filename = f"{trip.trip_code or 'trip'}_participants.xlsx"
-    await update.effective_message.reply_document(file_obj, filename=filename, caption=f"📥 خروجی {trip.title}")
-
-
-async def _set_trip_status_for_chat(update, context, status: str, success_text: str) -> None:
-    if not is_admin(update.effective_user.id, context) or not _is_group(update):
-        return
-    db = context.application.bot_data["db"]
-    trip = await db.get_trip_by_chat_id(update.effective_chat.id)
-    if not trip:
-        await update.effective_message.reply_text("این گروه به سفری متصل نیست.")
-        return
-    await db.set_trip_status(trip.id, status)
-    await update.effective_message.reply_text(success_text)
+    await _management_in_private(update, context)
 
 
 async def tripclose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_trip_status_for_chat(update, context, "closed", "🔒 ثبت سفر بسته شد.")
+    await _management_in_private(update, context)
 
 
 async def tripopen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_trip_status_for_chat(update, context, "open", "🔓 ثبت سفر دوباره باز شد.")
+    await _management_in_private(update, context)
 
 
 async def endtrip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _set_trip_status_for_chat(
-        update, context, "ended", "🏁 سفر پایان‌یافته ثبت شد. حالا می‌توانید حضور واقعی مسافرها را نهایی کنید."
-    )
-
-
-async def _participant_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE, status: str) -> None:
-    if not is_admin(update.effective_user.id, context) or not _is_group(update):
-        return
-    db = context.application.bot_data["db"]
-    trip = await db.get_trip_by_chat_id(update.effective_chat.id)
-    if not trip:
-        await update.effective_message.reply_text("این گروه به سفری متصل نیست.")
-        return
-    query_text = " ".join(context.args).strip()
-    if not query_text and update.effective_message.reply_to_message:
-        target = update.effective_message.reply_to_message.from_user
-        telegram_id = target.id
-        user = await db.get_user(telegram_id)
-    elif query_text:
-        matches = await db.search_users(query_text, limit=2)
-        if len(matches) != 1:
-            await update.effective_message.reply_text(
-                "یک عضو یکتا پیدا نشد. کد عضویت یا شماره دقیق را وارد کنید، یا دستور را روی پیام شخص Reply کنید."
-            )
-            return
-        user = matches[0]
-        telegram_id = user.telegram_id
-    else:
-        await update.effective_message.reply_text(
-            "دستور را روی پیام مسافر Reply کنید یا بعد از دستور کد عضویت/شماره را بنویسید."
-        )
-        return
-    participant = await db.set_trip_participant_status(trip.id, telegram_id, status)
-    if not participant:
-        await update.effective_message.reply_text("این فرد قبلاً حضور خود را برای این سفر ثبت نکرده است.")
-        return
-    name = user.full_name if user else str(telegram_id)
-    extra = ""
-    if status == "attended" and participant.points_awarded:
-        extra = f"\n⭐ {participant.awarded_points} امتیاز سفر ثبت شد."
-    await update.effective_message.reply_text(
-        f"✅ وضعیت {name}: {STATUS_LABELS.get(status, status)}{extra}"
-    )
+    await _management_in_private(update, context)
 
 
 async def tripattend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _participant_status_command(update, context, "attended")
+    await _management_in_private(update, context)
 
 
 async def tripcancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _participant_status_command(update, context, "cancelled")
+    await _management_in_private(update, context)
+
 
 
 def build_settrip_handler() -> ConversationHandler:
