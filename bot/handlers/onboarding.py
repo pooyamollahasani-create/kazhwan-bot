@@ -57,23 +57,45 @@ async def begin_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     context.user_data.clear()
 
-    # If this person already has a complete profile, approve immediately.
-    if existing and existing.rules_accepted and existing.channel_verified:
+    # Existing Kazhwan profile: BTC is a separate membership. If BTC rules were
+    # already accepted, approve immediately; otherwise ask only for BTC rules.
+    if existing and existing.channel_verified:
+        btc = await db.get_btc_membership(request.from_user.id)
+        if btc and btc.rules_accepted:
+            try:
+                await context.bot.approve_chat_join_request(request.chat.id, request.from_user.id)
+                await db.mark_group_approved_and_reward_referrer(request.from_user.id)
+                await db.delete_pending_join(request.from_user.id)
+                await context.bot.send_message(
+                    chat_id=request.user_chat_id,
+                    text=(
+                        f"سلام {existing.full_name} 🌿\n"
+                        "پروفایل کژوان و عضویت BTC شما از قبل ثبت شده بود و درخواست ورود تأیید شد."
+                    ),
+                    reply_markup=main_menu(),
+                )
+            except Exception:
+                logger.exception("Failed to approve an existing BTC user's join request")
+            return ConversationHandler.END
+
         try:
-            await context.bot.approve_chat_join_request(request.chat.id, request.from_user.id)
-            await db.mark_group_approved_and_reward_referrer(request.from_user.id)
-            await db.delete_pending_join(request.from_user.id)
             await context.bot.send_message(
                 chat_id=request.user_chat_id,
                 text=(
-                    f"سلام {existing.full_name} 🌿\n"
-                    "پروفایل شما از قبل تکمیل شده بود و درخواست عضویت‌تان تأیید شد."
+                    f"سلام {existing.full_name} 🌿\n\n"
+                    "پروفایل کژوان شما از قبل تکمیل شده است. برای عضویت در Beyond The Clouds "
+                    "فقط قوانین گروه را مطالعه و تأیید کنید."
                 ),
-                reply_markup=main_menu(),
             )
+            await context.bot.send_message(
+                chat_id=request.user_chat_id,
+                text=RULES_TEXT,
+                reply_markup=rules_keyboard(),
+            )
+            return RULES
         except Exception:
-            logger.exception("Failed to approve an existing user's join request")
-        return ConversationHandler.END
+            logger.exception("Could not send BTC rules to existing Kazhwan user")
+            return ConversationHandler.END
 
     try:
         await context.bot.send_message(
@@ -267,31 +289,6 @@ async def referral_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return REFERRAL_CODE
 
-    # If GROUP_CHAT_ID is configured, validate that the referrer is actually in the group.
-    settings = context.application.bot_data["settings"]
-    if settings.group_chat_id:
-        try:
-            member = await context.bot.get_chat_member(settings.group_chat_id, referrer.telegram_id)
-            valid_statuses = {
-                ChatMemberStatus.MEMBER,
-                ChatMemberStatus.ADMINISTRATOR,
-                ChatMemberStatus.OWNER,
-            }
-            if member.status not in valid_statuses:
-                await update.message.reply_text(
-                    "این کد متعلق به عضوی است که در حال حاضر داخل گروه نیست. "
-                    "کد دیگری وارد کنید یا «کد معرف ندارم» را بزنید.",
-                    reply_markup=referral_retry_keyboard(),
-                )
-                return REFERRAL_CODE
-        except Exception:
-            logger.exception("Could not validate referrer membership")
-            await update.message.reply_text(
-                "فعلاً امکان بررسی کد معرف نیست. دوباره تلاش کنید یا «کد معرف ندارم» را بزنید.",
-                reply_markup=referral_retry_keyboard(),
-            )
-            return REFERRAL_CODE
-
     context.user_data["referred_by_telegram_id"] = referrer.telegram_id
     await update.message.reply_text(f"✅ کد معرف {code} تأیید شد.")
     return await ask_channel_membership(update.message, context)
@@ -331,8 +328,13 @@ async def check_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return CHANNEL
 
     await query.edit_message_text("✅ عضویت شما در کانال تأیید شد.")
-    await query.message.reply_text(RULES_TEXT, reply_markup=rules_keyboard())
-    return RULES
+    db = context.application.bot_data["db"]
+    pending_join = await db.get_pending_join(query.from_user.id)
+    if pending_join:
+        await query.message.reply_text(RULES_TEXT, reply_markup=rules_keyboard())
+        return RULES
+    # Kazhwan profile / trip registration does not require BTC group rules.
+    return await finish_registration(update, context)
 
 
 async def accept_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -360,6 +362,9 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
             referred_by_telegram_id=context.user_data.get("referred_by_telegram_id"),
         )
 
+    # Referral is Kazhwan-wide, not tied to BTC membership.
+    await db.reward_referrer_if_needed(tg_user.id)
+
     approved = False
     pending_join = await db.get_pending_join(tg_user.id)
     pending_group_chat_id = pending_join.group_chat_id if pending_join else None
@@ -377,18 +382,20 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.exception("Failed to approve join request after onboarding")
 
     if approved:
+        btc = await db.get_btc_membership(tg_user.id)
         message = (
-            "🎉 عضویت شما با موفقیت تأیید شد و وارد گروه شدید.\n\n"
-            f"شناسه عضویت: {user.member_code}\n"
-            f"کد معرف اختصاصی شما: {user.referral_code}\n\n"
-            "این کد را می‌توانید به دوستانتان بدهید."
+            "🎉 عضویت شما در Beyond The Clouds با موفقیت تأیید شد.\n\n"
+            f"کد عضویت کژوان: {user.member_code}\n"
+            f"کد عضویت BTC: {btc.btc_code if btc else '-'}\n"
+            f"کد معرف کژوان: {user.referral_code}\n\n"
+            "کد معرف را می‌توانید به دوستانتان بدهید."
         )
     elif pending_group_chat_id:
         message = (
             "✅ اطلاعات شما با موفقیت ثبت شد، اما تأیید خودکار ورود به گروه انجام نشد.\n"
             "مدیران موضوع را بررسی می‌کنند.\n\n"
-            f"شناسه عضویت: {user.member_code}\n"
-            f"کد معرف اختصاصی شما: {user.referral_code}"
+            f"کد عضویت کژوان: {user.member_code}\n"
+            f"کد معرف کژوان: {user.referral_code}"
         )
     else:
         # Existing group members can register directly in PV without a Join Request.
@@ -410,17 +417,19 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
             await db.ensure_member_activity(
                 tg_user.id, tg_user.username, user.full_name
             )
+            btc = await db.get_btc_membership(tg_user.id)
             message = (
                 "✅ اطلاعات شما با موفقیت ثبت شد.\n\n"
-                f"شناسه عضویت: {user.member_code}\n"
-                f"کد معرف اختصاصی شما: {user.referral_code}"
+                f"کد عضویت کژوان: {user.member_code}\n"
+                f"کد عضویت BTC: {btc.btc_code if btc else '-'}\n"
+                f"کد معرف کژوان: {user.referral_code}"
             )
         else:
             message = (
                 "🎉 پروفایل شما با موفقیت ثبت شد.\n\n"
-                f"شناسه عضویت: {user.member_code}\n"
-                f"کد معرف اختصاصی شما: {user.referral_code}\n"
-                "اگر درخواست عضویت گروه را ارسال کنید، ربات می‌تواند آن را پس از بررسی تأیید کند."
+                f"کد عضویت کژوان: {user.member_code}\n"
+                f"کد معرف کژوان: {user.referral_code}\n"
+                "عضویت در BTC جداست و فقط در صورت درخواست عضویت گروه برای شما کد BTC صادر می‌شود."
             )
 
     pending_trip_id = context.user_data.get("pending_trip_id")

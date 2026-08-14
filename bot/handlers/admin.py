@@ -150,10 +150,12 @@ async def member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [f"🔎 نتیجه جستجو برای «{query}»", ""]
     for user in users[:10]:
         username = f"@{user.telegram_username}" if user.telegram_username else "-"
+        btc = await db.get_btc_membership(user.telegram_id)
         lines.extend([
             f"👤 {user.full_name}",
             f"📱 {user.phone} | 📍 {user.city}",
-            f"🆔 {user.member_code} | معرف: {user.referral_code}",
+            f"🆔 کژوان: {user.member_code} | BTC: {btc.btc_code if btc else '-'}",
+            f"کد معرف: {user.referral_code}",
             f"Telegram: {username} | ID: {user.telegram_id}",
             f"⭐ {user.points} امتیاز | 👥 {user.referral_count} معرفی",
             "—",
@@ -177,23 +179,51 @@ async def topreferrals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text("\n".join(lines))
 
 
-def _member_export_rows(users) -> tuple[list[str], list[list[object]]]:
+async def _member_export_rows(db, users) -> tuple[list[str], list[list[object]]]:
     headers = [
         "نام و نام خانوادگی", "شماره تماس", "شهر", "Username", "Telegram ID",
-        "کد عضویت", "کد معرف", "معرف Telegram ID", "تعداد معرفی موفق", "امتیاز",
-        "نحوه آشنایی", "تاریخ ثبت", "آخرین فعالیت", "وضعیت",
+        "کد عضویت کژوان", "کد عضویت BTC", "کد معرف کژوان", "معرف Telegram ID",
+        "تعداد معرفی موفق", "امتیاز کل", "نحوه آشنایی", "تاریخ ثبت",
+        "آخرین فعالیت", "وضعیت", "تاریخچه سفرهای داخلی", "تاریخچه سفرهای خارجی",
     ]
+
+    status_labels = {
+        "declared": "اعلام حضور",
+        "attended": "شرکت کرده",
+        "cancelled": "انصراف",
+    }
+    histories: dict[int, dict[str, list[str]]] = {}
+    for participant, trip in await db.list_all_trip_history():
+        bucket = histories.setdefault(participant.telegram_id, {"domestic": [], "international": []})
+        trip_type = getattr(trip, "trip_type", "domestic_multi") or "domestic_multi"
+        if trip_type == "international":
+            target = "international"
+            type_label = "خارجی"
+        else:
+            target = "domestic"
+            type_label = "یک‌روزه" if trip_type == "domestic_day" else "چندروزه"
+        awarded = getattr(participant, "awarded_points", 0) or 0
+        text = (
+            f"{trip.title} [{type_label}] ({trip.start_date_text} تا {trip.end_date_text}) - "
+            f"{status_labels.get(participant.status, participant.status)} - {awarded} امتیاز"
+        )
+        bucket[target].append(text)
+
     rows = []
     for user in users:
+        btc = await db.get_btc_membership(user.telegram_id)
+        user_history = histories.get(user.telegram_id, {"domestic": [], "international": []})
         rows.append([
             user.full_name, user.phone, user.city,
             f"@{user.telegram_username}" if user.telegram_username else "",
-            user.telegram_id, user.member_code or "", user.referral_code or "",
-            user.referred_by_telegram_id or "", user.referral_count, user.points,
-            user.discovery_source,
+            user.telegram_id, user.member_code or "", btc.btc_code if btc else "",
+            user.referral_code or "", user.referred_by_telegram_id or "",
+            user.referral_count, user.points, user.discovery_source,
             user.created_at.isoformat() if user.created_at else "",
             user.last_activity_at.isoformat() if user.last_activity_at else "",
             user.status,
+            " | ".join(user_history.get("domestic", [])),
+            " | ".join(user_history.get("international", [])),
         ])
     return headers, rows
 
@@ -211,8 +241,9 @@ async def _send_xlsx(update: Update, headers, rows, filename: str, sheet_name: s
 async def exportmembers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id, context):
         return
-    users = await context.application.bot_data["db"].list_group_users()
-    headers, rows = _member_export_rows(users)
+    db = context.application.bot_data["db"]
+    users = await db.list_group_users()
+    headers, rows = await _member_export_rows(db, users)
     await _send_xlsx(update, headers, rows, "kazhwan_members.xlsx", "Members")
 
 
@@ -271,13 +302,14 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ) if users else "هنوز معرفی موفقی ثبت نشده است."
         await query.message.reply_text(text)
     elif action == "exportall":
-        users = await context.application.bot_data["db"].list_group_users()
-        headers, rows = _member_export_rows(users)
+        db = context.application.bot_data["db"]
+        users = await db.list_group_users()
+        headers, rows = await _member_export_rows(db, users)
         file_obj = build_xlsx(headers, rows, sheet_name="Members")
         await query.message.reply_document(file_obj, filename="kazhwan_all_members.xlsx")
     elif action == "memberhelp":
         await query.message.reply_text(
-            "🔎 جستجوی عضو:\n/member نام یا شماره یا کد عضویت\n\nمثال: /member KZH-000012"
+            "🔎 جستجوی عضو:\n/member نام یا شماره یا کد عضویت\n\nمثال: /member KZH-000012 یا /member BTC-000012"
         )
 
 

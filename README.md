@@ -175,3 +175,16 @@ GROUP_CHAT_ID=-1001234567890
 ```
 
 `/tripattend` و `/tripcancel` را می‌توان روی پیام یک مسافر Reply کرد یا کد عضویت/شماره او را بعد از دستور نوشت.
+
+---
+
+## v1.4.2 — Kazhwan vs BTC membership
+
+`KZH-xxxxxx` is the permanent Kazhwan profile code. BTC is an optional separate membership with a `BTC-xxxxxx` code. Existing KZH codes are never replaced.
+
+Trip scoring:
+- Domestic one-day: 5 points
+- Domestic multi-day: 15 points
+- International: 100 points
+
+Trip passengers only need a Kazhwan profile and membership in `@Kazhwantravel`; BTC membership is optional.

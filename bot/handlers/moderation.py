@@ -4,7 +4,9 @@ from datetime import datetime, time, timedelta, timezone
 
 from telegram import ChatPermissions, Update
 from telegram.constants import ChatMemberStatus
-from telegram.ext import ChatMemberHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import ChatMemberHandler, CommandHandler, ContextTypes, MessageHandler, filters
+
+from bot.handlers.admin import is_admin
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,31 @@ def _is_quiet_now() -> bool:
     now = datetime.now(IRAN_TZ).time().replace(tzinfo=None)
     return now >= time(23, 0) or now < time(11, 0)
 
+
+
+def _open_permissions() -> ChatPermissions:
+    """Known-good daytime permissions for normal members.
+
+    We explicitly enable every message/media permission instead of restoring a
+    possibly stale snapshot. This prevents the group from remaining locked if a
+    previous Railway restart happened while the chat was already restricted.
+    """
+    return ChatPermissions(
+        can_send_messages=True,
+        can_send_audios=True,
+        can_send_documents=True,
+        can_send_photos=True,
+        can_send_videos=True,
+        can_send_video_notes=True,
+        can_send_voice_notes=True,
+        can_send_polls=True,
+        can_send_other_messages=True,
+        can_add_web_page_previews=True,
+        can_change_info=False,
+        can_invite_users=True,
+        can_pin_messages=False,
+        can_manage_topics=False,
+    )
 
 def _locked_permissions() -> ChatPermissions:
     return ChatPermissions(
@@ -69,37 +96,41 @@ async def unlock_group(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        saved = await db.get_saved_group_permissions(chat_id)
-        if saved:
-            permissions = ChatPermissions(**json.loads(saved))
-        else:
-            # Safe fallback for a normal discussion group if no snapshot exists.
-            permissions = ChatPermissions(
-                can_send_messages=True,
-                can_send_audios=True,
-                can_send_documents=True,
-                can_send_photos=True,
-                can_send_videos=True,
-                can_send_video_notes=True,
-                can_send_voice_notes=True,
-                can_send_polls=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True,
-                can_change_info=False,
-                can_invite_users=True,
-                can_pin_messages=False,
-                can_manage_topics=False,
-            )
-
         await context.bot.set_chat_permissions(
             chat_id=chat_id,
-            permissions=permissions,
+            permissions=_open_permissions(),
             use_independent_chat_permissions=True,
         )
         await db.clear_group_permissions(chat_id)
         logger.info("Quiet hours disabled for group %s", chat_id)
     except Exception:
         logger.exception("Failed to disable quiet hours")
+
+
+async def enforce_quiet_hours(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Self-heal the schedule if Railway restarts or a daily job is missed."""
+    settings = context.application.bot_data["settings"]
+    if not settings.group_chat_id:
+        return
+    db = context.application.bot_data["db"]
+    if _is_quiet_now():
+        await lock_group(context)
+    elif await db.get_saved_group_permissions(settings.group_chat_id):
+        await unlock_group(context)
+
+
+async def quiet_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id, context):
+        return
+    await lock_group(context)
+    await update.effective_message.reply_text("🔒 حالت سکوت گروه فعال شد.")
+
+
+async def quiet_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.effective_user or not is_admin(update.effective_user.id, context):
+        return
+    await unlock_group(context)
+    await update.effective_message.reply_text("🔓 محدودیت ارسال پیام گروه برداشته شد.")
 
 
 async def initialize_quiet_hours(application) -> None:
@@ -123,6 +154,12 @@ async def initialize_quiet_hours(application) -> None:
         unlock_group,
         time=QUIET_END,
         name="kazhwan_quiet_end",
+    )
+    application.job_queue.run_repeating(
+        enforce_quiet_hours,
+        interval=300,
+        first=60,
+        name="kazhwan_quiet_watchdog",
     )
 
     # If Railway restarts at night, the group should still remain closed;
@@ -196,6 +233,8 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 def moderation_handlers():
     return [
+        CommandHandler("quieton", quiet_on_command),
+        CommandHandler("quietoff", quiet_off_command),
         ChatMemberHandler(welcome_new_member, ChatMemberHandler.CHAT_MEMBER),
         MessageHandler(filters.ChatType.GROUPS, track_group_activity),
     ]

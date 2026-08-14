@@ -44,6 +44,8 @@ async def post_init(application: Application) -> None:
         ("tripparticipants", "فهرست مسافران سفر"),
         ("exporttrip", "خروجی Excel سفر"),
         ("chatid", "نمایش شناسه عددی گروه"),
+        ("quieton", "بستن دستی چت گروه"),
+        ("quietoff", "باز کردن دستی چت گروه"),
         ("cancel", "توقف فرآیند جاری"),
     ])
 

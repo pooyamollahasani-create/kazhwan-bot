@@ -4,6 +4,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 REFERRAL_REWARD_POINTS = 5
+TRIP_POINTS = {
+    "domestic_day": 5,
+    "domestic_multi": 15,
+    "international": 100,
+}
 
 
 class Base(DeclarativeBase):
@@ -26,6 +31,7 @@ class User(Base):
     referral_code: Mapped[str | None] = mapped_column(String(24), unique=True, nullable=True)
     referred_by_telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     referral_count: Mapped[int] = mapped_column(Integer, default=0)
+    referral_rewarded: Mapped[bool] = mapped_column(Boolean, default=False)
     group_approved: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(30), default="active")
     points: Mapped[int] = mapped_column(Integer, default=0)
@@ -35,6 +41,20 @@ class User(Base):
     last_activity_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+
+
+class BtcMembership(Base):
+    __tablename__ = "btc_memberships"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    btc_code: Mapped[str | None] = mapped_column(String(20), unique=True, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    rules_accepted: Mapped[bool] = mapped_column(Boolean, default=False)
+    joined_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
 
 
 class Activity(Base):
@@ -89,6 +109,8 @@ class Trip(Base):
     trip_code: Mapped[str | None] = mapped_column(String(24), unique=True, nullable=True, index=True)
     telegram_chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     title: Mapped[str] = mapped_column(String(200))
+    trip_type: Mapped[str] = mapped_column(String(24), default="domestic_multi", index=True)
+    points_value: Mapped[int] = mapped_column(Integer, default=15)
     start_date_text: Mapped[str] = mapped_column(String(80))
     end_date_text: Mapped[str] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(20), default="open", index=True)
@@ -113,6 +135,8 @@ class TripParticipant(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+    points_awarded: Mapped[bool] = mapped_column(Boolean, default=False)
+    awarded_points: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Database:
@@ -124,6 +148,7 @@ class Database:
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(self._migrate_users_table)
+            await conn.run_sync(self._migrate_trips_table)
 
         # Backfill referral codes for users that existed before this version.
         async with self.sessions() as session:
@@ -131,8 +156,62 @@ class Database:
             users = result.scalars().all()
             for user in users:
                 user.referral_code = f"KZH-R{user.id:06d}"
-            if users:
-                await session.commit()
+
+            # Existing successful referrals were already rewarded in older versions.
+            rewarded_result = await session.execute(
+                select(User).where(
+                    User.referred_by_telegram_id.is_not(None),
+                    User.group_approved.is_(True),
+                    User.referral_rewarded.is_(False),
+                )
+            )
+            for user in rewarded_result.scalars().all():
+                user.referral_rewarded = True
+
+            # Legacy Kazhwan profiles that had a referrer but were never BTC-approved
+            # did not receive the old BTC-tied reward. Award them once now.
+            pending_reward_result = await session.execute(
+                select(User).where(
+                    User.referred_by_telegram_id.is_not(None),
+                    User.referral_rewarded.is_(False),
+                )
+            )
+            for user in pending_reward_result.scalars().all():
+                ref_result = await session.execute(
+                    select(User).where(User.telegram_id == user.referred_by_telegram_id)
+                )
+                referrer = ref_result.scalar_one_or_none()
+                if referrer and referrer.telegram_id != user.telegram_id:
+                    referrer.points += REFERRAL_REWARD_POINTS
+                    referrer.referral_count += 1
+                    user.referral_rewarded = True
+                    session.add(
+                        Activity(
+                            telegram_id=referrer.telegram_id,
+                            activity_type="referral",
+                            title="معرفی عضو جدید کژوان",
+                            details=(
+                                f"{user.full_name} پروفایل کژوان را تکمیل کرد. "
+                                f"+{REFERRAL_REWARD_POINTS} امتیاز (مهاجرت)"
+                            ),
+                        )
+                    )
+
+            # Existing BTC members keep their KZH code and receive a separate BTC code.
+            btc_result = await session.execute(
+                select(User).where(User.group_approved.is_(True)).order_by(User.id.asc())
+            )
+            for user in btc_result.scalars().all():
+                existing_btc = await session.execute(
+                    select(BtcMembership).where(BtcMembership.telegram_id == user.telegram_id)
+                )
+                if existing_btc.scalar_one_or_none() is None:
+                    membership = BtcMembership(telegram_id=user.telegram_id, status="active", rules_accepted=True)
+                    session.add(membership)
+                    await session.flush()
+                    membership.btc_code = f"BTC-{membership.id:06d}"
+
+            await session.commit()
 
     @staticmethod
     def _migrate_users_table(sync_conn) -> None:
@@ -148,6 +227,7 @@ class Database:
             "referral_code": "VARCHAR(24)",
             "referred_by_telegram_id": "BIGINT",
             "referral_count": "INTEGER DEFAULT 0 NOT NULL",
+            "referral_rewarded": "BOOLEAN DEFAULT FALSE NOT NULL",
             "group_approved": "BOOLEAN DEFAULT FALSE NOT NULL",
         }
         for name, sql_type in additions.items():
@@ -162,6 +242,54 @@ class Database:
             "CREATE INDEX IF NOT EXISTS ix_users_referred_by_telegram_id "
             "ON users (referred_by_telegram_id)"
         )
+
+
+    @staticmethod
+    def _migrate_trips_table(sync_conn) -> None:
+        """Idempotent migration for trip categories and point awarding."""
+        inspector = inspect(sync_conn)
+        tables = inspector.get_table_names()
+        if "trips" in tables:
+            existing = {column["name"] for column in inspector.get_columns("trips")}
+            if "trip_type" not in existing:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trips ADD COLUMN trip_type VARCHAR(24) DEFAULT 'domestic_multi' NOT NULL"
+                )
+            if "points_value" not in existing:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trips ADD COLUMN points_value INTEGER DEFAULT 15 NOT NULL"
+                )
+            # Convert the old two-category model to the new one. Existing domestic trips
+            # are treated as multi-day until an admin redefines them with /settrip.
+            sync_conn.exec_driver_sql(
+                "UPDATE trips SET trip_type='domestic_multi' WHERE trip_type='domestic'"
+            )
+            sync_conn.exec_driver_sql(
+                "UPDATE trips SET points_value=100 WHERE trip_type='international'"
+            )
+            sync_conn.exec_driver_sql(
+                "UPDATE trips SET points_value=5 WHERE trip_type='domestic_day'"
+            )
+            sync_conn.exec_driver_sql(
+                "UPDATE trips SET points_value=15 WHERE trip_type='domestic_multi'"
+            )
+            sync_conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_trips_trip_type ON trips (trip_type)"
+            )
+
+        if "trip_participants" in tables:
+            existing_participant = {
+                column["name"] for column in inspector.get_columns("trip_participants")
+            }
+            if "points_awarded" not in existing_participant:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trip_participants ADD COLUMN points_awarded BOOLEAN DEFAULT FALSE NOT NULL"
+                )
+            if "awarded_points" not in existing_participant:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trip_participants ADD COLUMN awarded_points INTEGER DEFAULT 0 NOT NULL"
+                )
+
 
     async def save_pending_join(
         self, telegram_id: int, group_chat_id: int, user_chat_id: int
@@ -245,54 +373,111 @@ class Database:
             await session.refresh(user)
             return user
 
+    async def reward_referrer_if_needed(self, telegram_id: int) -> User | None:
+        """Award the Kazhwan referral reward exactly once after profile completion."""
+        async with self.sessions() as session:
+            result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+            user = result.scalar_one_or_none()
+            if not user or user.referral_rewarded or not user.referred_by_telegram_id:
+                return user
+
+            ref_result = await session.execute(
+                select(User).where(User.telegram_id == user.referred_by_telegram_id)
+            )
+            referrer = ref_result.scalar_one_or_none()
+            if referrer and referrer.telegram_id != user.telegram_id:
+                referrer.points += REFERRAL_REWARD_POINTS
+                referrer.referral_count += 1
+                user.referral_rewarded = True
+                session.add(
+                    Activity(
+                        telegram_id=referrer.telegram_id,
+                        activity_type="referral",
+                        title="معرفی عضو جدید کژوان",
+                        details=(
+                            f"{user.full_name} پروفایل کژوان را تکمیل کرد. "
+                            f"+{REFERRAL_REWARD_POINTS} امتیاز"
+                        ),
+                    )
+                )
+                await session.commit()
+                await session.refresh(user)
+            return user
+
+    async def ensure_btc_membership(self, telegram_id: int) -> BtcMembership | None:
+        async with self.sessions() as session:
+            user_result = await session.execute(
+                select(User).where(User.telegram_id == telegram_id)
+            )
+            user = user_result.scalar_one_or_none()
+            if not user:
+                return None
+            result = await session.execute(
+                select(BtcMembership).where(BtcMembership.telegram_id == telegram_id)
+            )
+            membership = result.scalar_one_or_none()
+            if membership:
+                return membership
+            membership = BtcMembership(telegram_id=telegram_id, status="active")
+            session.add(membership)
+            await session.flush()
+            membership.btc_code = f"BTC-{membership.id:06d}"
+            await session.commit()
+            await session.refresh(membership)
+            return membership
+
+    async def get_btc_membership(self, telegram_id: int) -> BtcMembership | None:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(BtcMembership).where(BtcMembership.telegram_id == telegram_id)
+            )
+            return result.scalar_one_or_none()
+
     async def mark_group_approved_and_reward_referrer(self, telegram_id: int) -> User | None:
-        """Mark approval and award the referral exactly once."""
+        """Mark BTC approval and ensure a separate BTC membership code.
+
+        The legacy method name is retained so deployed handlers remain compatible.
+        Referral points are now Kazhwan-wide and awarded on profile completion.
+        """
         async with self.sessions() as session:
             result = await session.execute(select(User).where(User.telegram_id == telegram_id))
             user = result.scalar_one_or_none()
             if not user:
                 return None
-            if user.group_approved:
-                return user
-
-            user.group_approved = True
-            session.add(
-                Activity(
-                    telegram_id=user.telegram_id,
-                    activity_type="group_join",
-                    title="عضویت در گروه تأیید شد",
-                    details=None,
-                )
-            )
-
-            if user.referred_by_telegram_id:
-                ref_result = await session.execute(
-                    select(User).where(User.telegram_id == user.referred_by_telegram_id)
-                )
-                referrer = ref_result.scalar_one_or_none()
-                if referrer and referrer.telegram_id != user.telegram_id:
-                    referrer.points += REFERRAL_REWARD_POINTS
-                    referrer.referral_count += 1
-                    session.add(
-                        Activity(
-                            telegram_id=referrer.telegram_id,
-                            activity_type="referral",
-                            title="معرفی عضو جدید",
-                            details=(
-                                f"{user.full_name} عضو گروه شد. "
-                                f"+{REFERRAL_REWARD_POINTS} امتیاز"
-                            ),
-                        )
+            if not user.group_approved:
+                user.group_approved = True
+                session.add(
+                    Activity(
+                        telegram_id=user.telegram_id,
+                        activity_type="btc_join",
+                        title="عضویت Beyond The Clouds تأیید شد",
+                        details=None,
                     )
-
+                )
+            btc_result = await session.execute(
+                select(BtcMembership).where(BtcMembership.telegram_id == telegram_id)
+            )
+            membership = btc_result.scalar_one_or_none()
+            if membership is None:
+                membership = BtcMembership(
+                    telegram_id=telegram_id, status="active", rules_accepted=True
+                )
+                session.add(membership)
+                await session.flush()
+                membership.btc_code = f"BTC-{membership.id:06d}"
+            else:
+                membership.rules_accepted = True
+                membership.status = "active"
             await session.commit()
             await session.refresh(user)
             return user
+
 
     async def touch_member_activity(
         self, telegram_id: int, username: str | None, display_name: str
     ) -> None:
         now = datetime.now(timezone.utc)
+        points_value = TRIP_POINTS.get(trip_type, 0)
         async with self.sessions() as session:
             activity = await session.get(MemberActivity, telegram_id)
             if activity:
@@ -353,9 +538,24 @@ class Database:
                 select(User).where(User.telegram_id == telegram_id)
             )
             user = result.scalar_one_or_none()
-            if user and not user.group_approved:
-                user.group_approved = True
-                await session.commit()
+            if not user:
+                return
+            user.group_approved = True
+            btc_result = await session.execute(
+                select(BtcMembership).where(BtcMembership.telegram_id == telegram_id)
+            )
+            membership = btc_result.scalar_one_or_none()
+            if membership is None:
+                membership = BtcMembership(
+                    telegram_id=telegram_id, status="active", rules_accepted=True
+                )
+                session.add(membership)
+                await session.flush()
+                membership.btc_code = f"BTC-{membership.id:06d}"
+            else:
+                membership.rules_accepted = True
+                membership.status = "active"
+            await session.commit()
 
     async def get_saved_group_permissions(self, group_chat_id: int) -> str | None:
         async with self.sessions() as session:
@@ -415,6 +615,17 @@ class Database:
         like = f"%{value}%"
         normalized = value.upper().replace(" ", "")
         async with self.sessions() as session:
+            if normalized.startswith("BTC-"):
+                btc_result = await session.execute(
+                    select(User)
+                    .join(BtcMembership, BtcMembership.telegram_id == User.telegram_id)
+                    .where(func.upper(BtcMembership.btc_code).ilike(f"%{normalized}%"))
+                    .order_by(User.full_name.asc())
+                    .limit(limit)
+                )
+                btc_users = list(btc_result.scalars().all())
+                if btc_users:
+                    return btc_users
             conditions = [
                 User.full_name.ilike(like),
                 User.phone.ilike(like),
@@ -456,9 +667,11 @@ class Database:
         title: str,
         start_date_text: str,
         end_date_text: str,
+        trip_type: str,
         created_by_telegram_id: int,
     ) -> Trip:
         now = datetime.now(timezone.utc)
+        points_value = TRIP_POINTS.get(trip_type, 0)
         async with self.sessions() as session:
             result = await session.execute(
                 select(Trip).where(Trip.telegram_chat_id == telegram_chat_id)
@@ -468,6 +681,8 @@ class Database:
                 trip.title = title
                 trip.start_date_text = start_date_text
                 trip.end_date_text = end_date_text
+                trip.trip_type = trip_type
+                trip.points_value = points_value
                 trip.status = "open"
                 trip.created_by_telegram_id = created_by_telegram_id
                 trip.updated_at = now
@@ -475,6 +690,8 @@ class Database:
                 trip = Trip(
                     telegram_chat_id=telegram_chat_id,
                     title=title,
+                    trip_type=trip_type,
+                    points_value=points_value,
                     start_date_text=start_date_text,
                     end_date_text=end_date_text,
                     created_by_telegram_id=created_by_telegram_id,
@@ -558,24 +775,43 @@ class Database:
             participant.updated_at = datetime.now(timezone.utc)
             trip = await session.get(Trip, trip_id)
             if trip and status == "attended":
-                check = await session.execute(
-                    select(Activity).where(
-                        Activity.telegram_id == telegram_id,
-                        Activity.activity_type == "trip_attended",
-                        Activity.details == trip.trip_code,
-                    )
+                user_result = await session.execute(
+                    select(User).where(User.telegram_id == telegram_id)
                 )
-                if check.scalar_one_or_none() is None:
+                user = user_result.scalar_one_or_none()
+                if user and not participant.points_awarded:
+                    points = int(trip.points_value or TRIP_POINTS.get(trip.trip_type, 0))
+                    user.points += points
+                    participant.points_awarded = True
+                    participant.awarded_points = points
                     session.add(
                         Activity(
                             telegram_id=telegram_id,
                             activity_type="trip_attended",
                             title=f"شرکت در سفر {trip.title}",
-                            details=trip.trip_code,
+                            details=f"{trip.trip_code} | +{points} امتیاز",
                         )
                     )
+                else:
+                    check = await session.execute(
+                        select(Activity).where(
+                            Activity.telegram_id == telegram_id,
+                            Activity.activity_type == "trip_attended",
+                            Activity.title == f"شرکت در سفر {trip.title}",
+                        )
+                    )
+                    if check.scalar_one_or_none() is None:
+                        session.add(
+                            Activity(
+                                telegram_id=telegram_id,
+                                activity_type="trip_attended",
+                                title=f"شرکت در سفر {trip.title}",
+                                details=trip.trip_code,
+                            )
+                        )
             await session.commit()
             return participant
+
 
     async def list_trip_participants(self, trip_id: int) -> list[tuple[TripParticipant, User | None]]:
         async with self.sessions() as session:
@@ -601,6 +837,16 @@ class Database:
                 .join(Trip, Trip.id == TripParticipant.trip_id)
                 .where(TripParticipant.telegram_id == telegram_id)
                 .order_by(Trip.created_at.desc())
+            )
+            return list(result.all())
+
+
+    async def list_all_trip_history(self) -> list[tuple[TripParticipant, Trip]]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(TripParticipant, Trip)
+                .join(Trip, Trip.id == TripParticipant.trip_id)
+                .order_by(TripParticipant.telegram_id.asc(), Trip.created_at.asc())
             )
             return list(result.all())
 
