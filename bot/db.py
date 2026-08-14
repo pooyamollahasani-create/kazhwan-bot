@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, Text, func, inspect, select
+from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, Text, func, inspect, or_, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -80,6 +80,39 @@ class GroupModerationState(Base):
 
     group_chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     saved_permissions_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class Trip(Base):
+    __tablename__ = "trips"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trip_code: Mapped[str | None] = mapped_column(String(24), unique=True, nullable=True, index=True)
+    telegram_chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    start_date_text: Mapped[str] = mapped_column(String(80))
+    end_date_text: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    created_by_telegram_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class TripParticipant(Base):
+    __tablename__ = "trip_participants"
+
+    trip_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="declared", index=True)
+    declared_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
 
 
 class Database:
@@ -349,6 +382,227 @@ class Database:
             if state:
                 state.saved_permissions_json = None
                 await session.commit()
+
+    async def list_users(self, limit: int = 5000) -> list[User]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(User).order_by(User.created_at.asc()).limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def list_group_users(self, limit: int = 5000) -> list[User]:
+        """Users whose membership in the main Kazhwan/BTC group was approved/confirmed."""
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(User)
+                .where(User.group_approved.is_(True))
+                .order_by(User.created_at.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def count_group_users(self) -> int:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(func.count(User.id)).where(User.group_approved.is_(True))
+            )
+            return int(result.scalar_one())
+
+    async def search_users(self, query: str, limit: int = 20) -> list[User]:
+        value = query.strip()
+        if not value:
+            return []
+        like = f"%{value}%"
+        normalized = value.upper().replace(" ", "")
+        async with self.sessions() as session:
+            conditions = [
+                User.full_name.ilike(like),
+                User.phone.ilike(like),
+                User.telegram_username.ilike(like),
+                func.upper(User.member_code).ilike(f"%{normalized}%"),
+                func.upper(User.referral_code).ilike(f"%{normalized}%"),
+            ]
+            if value.lstrip("-").isdigit():
+                conditions.append(User.telegram_id == int(value))
+            result = await session.execute(
+                select(User).where(or_(*conditions)).order_by(User.full_name.asc()).limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def list_unregistered_seen_members(self, limit: int = 500) -> list[MemberActivity]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(MemberActivity)
+                .outerjoin(User, User.telegram_id == MemberActivity.telegram_id)
+                .where(User.id.is_(None))
+                .order_by(MemberActivity.last_activity_at.desc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def list_top_referrers(self, limit: int = 20) -> list[User]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(User)
+                .where(User.referral_count > 0)
+                .order_by(User.referral_count.desc(), User.points.desc(), User.full_name.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def create_or_update_trip(
+        self,
+        telegram_chat_id: int,
+        title: str,
+        start_date_text: str,
+        end_date_text: str,
+        created_by_telegram_id: int,
+    ) -> Trip:
+        now = datetime.now(timezone.utc)
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(Trip).where(Trip.telegram_chat_id == telegram_chat_id)
+            )
+            trip = result.scalar_one_or_none()
+            if trip:
+                trip.title = title
+                trip.start_date_text = start_date_text
+                trip.end_date_text = end_date_text
+                trip.status = "open"
+                trip.created_by_telegram_id = created_by_telegram_id
+                trip.updated_at = now
+            else:
+                trip = Trip(
+                    telegram_chat_id=telegram_chat_id,
+                    title=title,
+                    start_date_text=start_date_text,
+                    end_date_text=end_date_text,
+                    created_by_telegram_id=created_by_telegram_id,
+                    status="open",
+                    updated_at=now,
+                )
+                session.add(trip)
+                await session.flush()
+                trip.trip_code = f"TRIP-{trip.id:05d}"
+            await session.commit()
+            await session.refresh(trip)
+            return trip
+
+    async def get_trip_by_chat_id(self, telegram_chat_id: int) -> Trip | None:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(Trip).where(Trip.telegram_chat_id == telegram_chat_id)
+            )
+            return result.scalar_one_or_none()
+
+    async def get_trip(self, trip_id: int) -> Trip | None:
+        async with self.sessions() as session:
+            return await session.get(Trip, trip_id)
+
+    async def set_trip_status(self, trip_id: int, status: str) -> Trip | None:
+        async with self.sessions() as session:
+            trip = await session.get(Trip, trip_id)
+            if not trip:
+                return None
+            trip.status = status
+            trip.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(trip)
+            return trip
+
+    async def register_trip_participant(self, trip_id: int, telegram_id: int) -> TripParticipant:
+        now = datetime.now(timezone.utc)
+        async with self.sessions() as session:
+            participant = await session.get(TripParticipant, (trip_id, telegram_id))
+            if participant:
+                participant.status = "declared"
+                participant.updated_at = now
+            else:
+                participant = TripParticipant(
+                    trip_id=trip_id, telegram_id=telegram_id, status="declared", updated_at=now
+                )
+                session.add(participant)
+            user_result = await session.execute(
+                select(User).where(User.telegram_id == telegram_id)
+            )
+            user = user_result.scalar_one_or_none()
+            trip = await session.get(Trip, trip_id)
+            if user and trip:
+                existing_activity = await session.execute(
+                    select(Activity).where(
+                        Activity.telegram_id == telegram_id,
+                        Activity.activity_type == "trip_declared",
+                        Activity.details == trip.trip_code,
+                    )
+                )
+                if existing_activity.scalar_one_or_none() is None:
+                    session.add(
+                        Activity(
+                            telegram_id=telegram_id,
+                            activity_type="trip_declared",
+                            title=f"اعلام حضور در سفر {trip.title}",
+                            details=trip.trip_code,
+                        )
+                    )
+            await session.commit()
+            return participant
+
+    async def set_trip_participant_status(
+        self, trip_id: int, telegram_id: int, status: str
+    ) -> TripParticipant | None:
+        async with self.sessions() as session:
+            participant = await session.get(TripParticipant, (trip_id, telegram_id))
+            if not participant:
+                return None
+            participant.status = status
+            participant.updated_at = datetime.now(timezone.utc)
+            trip = await session.get(Trip, trip_id)
+            if trip and status == "attended":
+                check = await session.execute(
+                    select(Activity).where(
+                        Activity.telegram_id == telegram_id,
+                        Activity.activity_type == "trip_attended",
+                        Activity.details == trip.trip_code,
+                    )
+                )
+                if check.scalar_one_or_none() is None:
+                    session.add(
+                        Activity(
+                            telegram_id=telegram_id,
+                            activity_type="trip_attended",
+                            title=f"شرکت در سفر {trip.title}",
+                            details=trip.trip_code,
+                        )
+                    )
+            await session.commit()
+            return participant
+
+    async def list_trip_participants(self, trip_id: int) -> list[tuple[TripParticipant, User | None]]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(TripParticipant, User)
+                .outerjoin(User, User.telegram_id == TripParticipant.telegram_id)
+                .where(TripParticipant.trip_id == trip_id)
+                .order_by(TripParticipant.declared_at.asc())
+            )
+            return list(result.all())
+
+    async def count_trip_participants(self, trip_id: int) -> int:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(func.count()).select_from(TripParticipant).where(TripParticipant.trip_id == trip_id)
+            )
+            return int(result.scalar_one())
+
+    async def list_user_trips(self, telegram_id: int) -> list[tuple[TripParticipant, Trip]]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(TripParticipant, Trip)
+                .join(Trip, Trip.id == TripParticipant.trip_id)
+                .where(TripParticipant.telegram_id == telegram_id)
+                .order_by(Trip.created_at.desc())
+            )
+            return list(result.all())
 
     async def list_activities(self, telegram_id: int, limit: int = 15) -> list[Activity]:
         async with self.sessions() as session:

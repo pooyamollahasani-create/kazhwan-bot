@@ -125,3 +125,53 @@ GROUP_CHAT_ID=-1001234567890
 ربات در گروه باید دسترسی مدیریت Join Request / Invite Users را داشته باشد تا بتواند درخواست عضویت را تأیید کند.
 
 ربات همچنین باید در کانال `@Kazhwantravel` ادمین باشد تا بتواند عضویت کاربران را بررسی کند.
+
+---
+
+## v1.4 — پنل مدیریت و سفرها
+
+### پنل مدیریت BTC
+
+```text
+/admin
+/stats
+/member <نام|شماره|کد عضویت|Telegram ID>
+/inactive30
+/inactive60
+/topreferrals
+/exportmembers
+/exportinactive
+/exportreferrals
+/exportall
+```
+
+### گروه هر سفر
+
+ربات را به گروه سفر اضافه کنید و مدیر داخل همان گروه بزند:
+
+```text
+/settrip
+```
+
+سپس نام، تاریخ شروع و تاریخ پایان را پاسخ دهد. بعد از ثبت سفر:
+
+```text
+/tripregister
+```
+
+دکمه ثبت سفر در پروفایل مسافر منتشر می‌شود.
+
+دستورات مدیریتی سفر:
+
+```text
+/tripinfo
+/tripparticipants
+/exporttrip
+/tripclose
+/tripopen
+/endtrip
+/tripattend
+/tripcancel
+```
+
+`/tripattend` و `/tripcancel` را می‌توان روی پیام یک مسافر Reply کرد یا کد عضویت/شماره او را بعد از دستور نوشت.

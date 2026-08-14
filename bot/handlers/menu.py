@@ -25,16 +25,31 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db = context.application.bot_data["db"]
     activities = await db.list_activities(update.effective_user.id)
-    if not activities:
+    trips = await db.list_user_trips(update.effective_user.id)
+    if not activities and not trips:
         await update.message.reply_text("هنوز فعالیتی برای شما ثبت نشده است.")
         return
 
     lines = ["📜 تاریخچه فعالیت‌های من", ""]
-    for item in activities:
-        date_text = item.created_at.strftime("%Y/%m/%d")
-        lines.append(f"• {date_text} — {item.title}")
-        if item.details:
-            lines.append(f"  {item.details}")
+    if trips:
+        labels = {
+            "declared": "🟡 اعلام حضور",
+            "attended": "🟢 شرکت کرده",
+            "cancelled": "⚪ انصراف",
+        }
+        lines.append("🧳 سفرهای من")
+        for participant, trip in trips:
+            lines.append(
+                f"• {trip.title} — {trip.start_date_text} تا {trip.end_date_text} — "
+                f"{labels.get(participant.status, participant.status)}"
+            )
+        lines.append("")
+
+    if activities:
+        lines.append("🌿 سایر فعالیت‌ها")
+        for item in activities:
+            date_text = item.created_at.strftime("%Y/%m/%d")
+            lines.append(f"• {date_text} — {item.title}")
     await update.message.reply_text("\n".join(lines))
 
 async def card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

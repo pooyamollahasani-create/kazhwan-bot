@@ -21,6 +21,7 @@ from bot.keyboards import (
     referral_question_keyboard,
     referral_retry_keyboard,
     rules_keyboard,
+    trip_confirm_keyboard,
 )
 from bot.texts import RULES_TEXT, WELCOME_TEXT
 
@@ -104,6 +105,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     db = context.application.bot_data["db"]
+    pending_trip_id = None
+    if context.args and context.args[0].startswith("trip_"):
+        try:
+            pending_trip_id = int(context.args[0].split("_", 1)[1])
+        except (ValueError, IndexError):
+            pending_trip_id = None
+
+    if pending_trip_id is not None:
+        trip = await db.get_trip(pending_trip_id)
+        if not trip:
+            await update.message.reply_text("این سفر پیدا نشد یا دیگر در دسترس نیست.")
+            pending_trip_id = None
+        elif trip.status != "open":
+            await update.message.reply_text("ثبت این سفر در حال حاضر بسته است.")
+            pending_trip_id = None
+
     user = await db.get_user(update.effective_user.id)
     if user:
         settings = context.application.bot_data["settings"]
@@ -121,6 +138,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     )
             except Exception:
                 logger.exception("Could not check existing member status on /start")
+        if pending_trip_id is not None:
+            trip = await db.get_trip(pending_trip_id)
+            if trip:
+                await update.message.reply_text(
+                    f"🧳 سفر «{trip.title}» | {trip.start_date_text} تا {trip.end_date_text}\n\n"
+                    "این سفر در پروفایل شما ثبت شود؟",
+                    reply_markup=trip_confirm_keyboard(trip.id),
+                )
+                return ConversationHandler.END
         await update.message.reply_text(
             f"سلام {user.full_name} 🌿",
             reply_markup=main_menu(),
@@ -128,6 +154,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     context.user_data.clear()
+    if pending_trip_id is not None:
+        context.user_data["pending_trip_id"] = pending_trip_id
 
     await update.message.reply_text(WELCOME_TEXT)
     await update.message.reply_text("لطفاً نام و نام خانوادگی خود را وارد کنید:")
@@ -395,10 +423,18 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "اگر درخواست عضویت گروه را ارسال کنید، ربات می‌تواند آن را پس از بررسی تأیید کند."
             )
 
-    if update.callback_query:
-        await update.callback_query.message.reply_text(message, reply_markup=main_menu())
-    else:
-        await update.message.reply_text(message, reply_markup=main_menu())
+    pending_trip_id = context.user_data.get("pending_trip_id")
+    target_message = update.callback_query.message if update.callback_query else update.message
+    await target_message.reply_text(message, reply_markup=main_menu())
+
+    if pending_trip_id is not None:
+        trip = await db.get_trip(int(pending_trip_id))
+        if trip and trip.status == "open":
+            await target_message.reply_text(
+                f"🧳 سفر «{trip.title}» | {trip.start_date_text} تا {trip.end_date_text}\n\n"
+                "این سفر در پروفایل شما ثبت شود؟",
+                reply_markup=trip_confirm_keyboard(trip.id),
+            )
 
     context.user_data.clear()
     return ConversationHandler.END

@@ -67,3 +67,21 @@ def main_menu() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
+
+def trip_confirm_keyboard(trip_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ بله، ثبت شود", callback_data=f"tripconfirm:{trip_id}:yes"),
+            InlineKeyboardButton("❌ خیر", callback_data=f"tripconfirm:{trip_id}:no"),
+        ]
+    ])
+
+
+def trip_register_link_keyboard(bot_username: str, trip_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "✅ ثبت سفر در پروفایل من",
+            url=f"https://t.me/{bot_username}?start=trip_{trip_id}",
+        )]
+    ])
