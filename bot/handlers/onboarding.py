@@ -1,6 +1,6 @@
 import logging
 
-from telegram import ReplyKeyboardRemove, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ChatMemberStatus, ChatType
 from telegram.ext import (
     CallbackQueryHandler,
@@ -344,11 +344,37 @@ async def accept_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     return await finish_registration(update, context)
 
 
+async def _notify_admins_about_guest_matches(context: ContextTypes.DEFAULT_TYPE, user) -> None:
+    db = context.application.bot_data["db"]
+    settings = context.application.bot_data["settings"]
+    candidates = await db.find_guest_match_candidates(user.full_name, user.phone, limit=8)
+    if not candidates:
+        return
+    for guest in candidates:
+        phone_text = guest.phone or "بدون شماره"
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ اتصال سابقه", callback_data=f"guestmatch:link:{guest.id}:{user.telegram_id}"),
+            InlineKeyboardButton("❌ این شخص نیست", callback_data=f"guestmatch:skip:{guest.id}:{user.telegram_id}"),
+        ]])
+        text = (
+            "🔗 احتمال تطبیق مسافر موقت با پروفایل جدید\n\n"
+            f"پروفایل جدید: {user.full_name} | {user.phone}\n"
+            f"سابقه موقت: {guest.full_name} | {phone_text}\n\n"
+            "اگر یک نفر هستند، اتصال را تأیید کنید. امتیاز سفرهای تأییدشده بعد از اتصال منتقل می‌شود."
+        )
+        for admin_id in settings.admin_ids:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=text, reply_markup=keyboard)
+            except Exception:
+                logger.exception("Could not send guest-match suggestion to admin %s", admin_id)
+
+
 async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     db = context.application.bot_data["db"]
     tg_user = update.effective_user
 
     existing = await db.get_user(tg_user.id)
+    is_new_profile = existing is None
     if existing:
         user = existing
     else:
@@ -364,6 +390,11 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # Referral is Kazhwan-wide, not tied to BTC membership.
     await db.reward_referrer_if_needed(tg_user.id)
+
+    # If this newly-created profile resembles a manually-entered traveler,
+    # ask admins to confirm the merge. Never auto-merge by name alone.
+    if is_new_profile:
+        await _notify_admins_about_guest_matches(context, user)
 
     approved = False
     pending_join = await db.get_pending_join(tg_user.id)

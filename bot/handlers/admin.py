@@ -16,7 +16,7 @@ from bot.db import Trip
 
 logger = logging.getLogger(__name__)
 
-MANUAL_TRIP_TITLE, MANUAL_TRIP_TYPE, MANUAL_TRIP_START, MANUAL_TRIP_END, MANUAL_GUEST_NAME, MANUAL_GUEST_PHONE, MANUAL_GUEST_STATUS = range(100, 107)
+MANUAL_TRIP_TITLE, MANUAL_TRIP_TYPE, MANUAL_TRIP_START, MANUAL_TRIP_END, MANUAL_GUEST_NAME, MANUAL_GUEST_PHONE, MANUAL_GUEST_STATUS, MANUAL_TRIP_DUPLICATE = range(100, 108)
 
 
 STATUS_LABELS = {
@@ -33,6 +33,7 @@ TRIP_STATUS_LABELS = {
     "open": "🟢 باز",
     "closed": "🔒 بسته",
     "ended": "🏁 پایان‌یافته",
+    "archived": "🗃 آرشیوشده",
 }
 
 
@@ -89,6 +90,7 @@ def _trip_list_keyboard(trips) -> InlineKeyboardMarkup:
     for trip in trips[:30]:
         label = f"{TRIP_STATUS_LABELS.get(trip.status, trip.status)} | {trip.title} | {trip.trip_code}"
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"tripadmin:view:{trip.id}")])
+    rows.append([InlineKeyboardButton("🗃 سفرهای آرشیوشده", callback_data="tripadmin:archived")])
     rows.append([InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")])
     return InlineKeyboardMarkup(rows)
 
@@ -107,6 +109,8 @@ def _trip_actions_keyboard(trip) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton("🔓 باز کردن ثبت", callback_data=f"tripadmin:status:{trip.id}:open")])
     if trip.status != "ended":
         rows.append([InlineKeyboardButton("🏁 پایان سفر", callback_data=f"tripadmin:status:{trip.id}:ended")])
+    rows.append([InlineKeyboardButton("🔀 ادغام سفر تکراری", callback_data=f"tripadmin:merge:{trip.id}")])
+    rows.append([InlineKeyboardButton("🗑 آرشیو / حذف سفر", callback_data=f"tripadmin:archive:{trip.id}")])
     rows.extend([
         [InlineKeyboardButton("⬅️ سفرها", callback_data="admin:trips")],
         [InlineKeyboardButton("🏠 پنل مدیریت", callback_data="admin:home")],
@@ -506,19 +510,66 @@ async def manual_trip_end_date(update: Update, context: ContextTypes.DEFAULT_TYP
     value = (update.effective_message.text or "").strip()
     if not value:
         return MANUAL_TRIP_END
+    context.user_data["manual_trip_end"] = value
     db = context.application.bot_data["db"]
+    similar = await db.find_similar_trips(
+        context.user_data["manual_trip_title"],
+        context.user_data["manual_trip_start"],
+        value,
+        context.user_data["manual_trip_type"],
+        limit=5,
+    )
+    if similar:
+        rows = [[InlineKeyboardButton(
+            f"🔗 استفاده از {trip.title} | {trip.trip_code}"[:60],
+            callback_data=f"manualtripdupe:use:{trip.id}"
+        )] for trip in similar]
+        rows.append([InlineKeyboardButton("➕ با وجود شباهت، سفر جدید بساز", callback_data="manualtripdupe:new")])
+        await update.effective_message.reply_text(
+            "⚠️ یک سفر مشابه از قبل ثبت شده است.\n"
+            "برای جلوگیری از رکورد تکراری، سفر موجود را انتخاب کنید یا آگاهانه سفر جدید بسازید.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return MANUAL_TRIP_DUPLICATE
+    return await _create_manual_trip_from_context(update, context)
+
+
+async def _create_manual_trip_from_context(update_or_query, context: ContextTypes.DEFAULT_TYPE) -> int:
+    db = context.application.bot_data["db"]
+    user = update_or_query.effective_user if isinstance(update_or_query, Update) else update_or_query.from_user
     trip = await db.create_manual_trip(
         title=context.user_data["manual_trip_title"],
         start_date_text=context.user_data["manual_trip_start"],
-        end_date_text=value,
+        end_date_text=context.user_data["manual_trip_end"],
         trip_type=context.user_data["manual_trip_type"],
-        created_by_telegram_id=update.effective_user.id,
+        created_by_telegram_id=user.id,
     )
     context.user_data.clear()
-    await update.effective_message.reply_text(
+    message = update_or_query.effective_message if isinstance(update_or_query, Update) else update_or_query.message
+    await message.reply_text(
         f"✅ سفر «{trip.title}» ثبت شد.\n🆔 {trip.trip_code}\n"
         f"نوع: {TRIP_TYPE_LABELS.get(trip.trip_type, trip.trip_type)}\n⭐ امتیاز: {trip.points_value}\n\n"
         "این سفر بدون گروه تلگرام هم قابل مدیریت است.",
+        reply_markup=_trip_actions_keyboard(trip),
+    )
+    return ConversationHandler.END
+
+
+async def manual_trip_duplicate_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return MANUAL_TRIP_DUPLICATE
+    await query.answer()
+    if query.data == "manualtripdupe:new":
+        return await _create_manual_trip_from_context(query, context)
+    trip_id = int(query.data.rsplit(":", 1)[1])
+    trip = await context.application.bot_data["db"].get_trip(trip_id)
+    context.user_data.clear()
+    if not trip:
+        await query.message.reply_text("سفر موجود پیدا نشد؛ دوباره تلاش کنید.")
+        return ConversationHandler.END
+    await query.message.reply_text(
+        f"✅ از سفر موجود استفاده می‌کنیم: «{trip.title}» | {trip.trip_code}",
         reply_markup=_trip_actions_keyboard(trip),
     )
     return ConversationHandler.END
@@ -635,6 +686,7 @@ def build_admin_flow_handler() -> ConversationHandler:
             MANUAL_TRIP_TYPE: [CallbackQueryHandler(manual_trip_type, pattern=r"^manualtriptype:(domestic_day|domestic_multi|international)$")],
             MANUAL_TRIP_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_trip_start_date)],
             MANUAL_TRIP_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_trip_end_date)],
+            MANUAL_TRIP_DUPLICATE: [CallbackQueryHandler(manual_trip_duplicate_choice, pattern=r"^manualtripdupe:(?:use:\d+|new)$")],
             MANUAL_GUEST_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_guest_name)],
             MANUAL_GUEST_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_guest_phone)],
             MANUAL_GUEST_STATUS: [CallbackQueryHandler(manual_guest_status, pattern=r"^manualgueststatus:(declared|attended|cancelled)$")],
@@ -689,10 +741,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.message.reply_text("\n".join(lines))
     elif action == "trips":
         trips = await _list_trips_compat(context.application.bot_data["db"], limit=30)
-        if not trips:
-            await query.message.reply_text("هنوز سفری ثبت نشده است.", reply_markup=_back_admin_keyboard())
-        else:
-            await query.message.reply_text("🧳 مدیریت سفرها\n\nسفر موردنظر را انتخاب کنید:", reply_markup=_trip_list_keyboard(trips))
+        await query.message.reply_text(
+            "🧳 مدیریت سفرها\n\nسفر موردنظر را انتخاب کنید:" if trips else "🧳 هنوز سفری ثبت نشده است. سفر جدید تعریف کنید:",
+            reply_markup=_trip_list_keyboard(trips),
+        )
 
 
 async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -707,7 +759,112 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     action = parts[1]
     db = context.application.bot_data["db"]
 
-    if action == "view":
+    if action == "archived":
+        trips = await db.list_archived_trips(limit=30)
+        rows = []
+        for trip in trips:
+            suffix = f" → {trip.merged_into_trip_id}" if trip.merged_into_trip_id else ""
+            rows.append([InlineKeyboardButton(
+                f"🗃 {trip.title} | {trip.trip_code}{suffix}"[:60],
+                callback_data=f"tripadmin:archivedview:{trip.id}",
+            )])
+        rows.append([InlineKeyboardButton("⬅️ سفرهای فعال", callback_data="admin:trips")])
+        await query.message.reply_text(
+            "🗃 سفرهای آرشیوشده" if trips else "هیچ سفر آرشیوشده‌ای وجود ندارد.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    elif action == "archivedview":
+        trip = await db.get_trip(int(parts[2]))
+        if not trip:
+            await query.message.reply_text("سفر پیدا نشد.")
+            return
+        rows = []
+        if trip.merged_into_trip_id is None:
+            rows.append([InlineKeyboardButton("♻️ بازیابی سفر", callback_data=f"tripadmin:restore:{trip.id}")])
+        rows.append([InlineKeyboardButton("⬅️ آرشیو", callback_data="tripadmin:archived")])
+        merged = f"\n🔀 ادغام‌شده در سفر ID {trip.merged_into_trip_id}" if trip.merged_into_trip_id else ""
+        await query.message.reply_text(
+            f"🗃 {trip.title}\n🆔 {trip.trip_code}\n📅 {trip.start_date_text} تا {trip.end_date_text}{merged}",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    elif action == "archive":
+        trip = await db.get_trip(int(parts[2]))
+        if not trip:
+            await query.message.reply_text("سفر پیدا نشد.")
+            return
+        people = await _all_trip_people(db, trip.id)
+        await query.message.reply_text(
+            f"⚠️ آرشیو «{trip.title}»؟\n\n{len(people)} مسافر به این سفر متصل هستند. "
+            "سفر از تاریخچه فعال حذف می‌شود و امتیازهای همین سفر موقتاً برگردانده می‌شوند؛ بعداً امکان بازیابی وجود دارد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 بله، آرشیو کن", callback_data=f"tripadmin:archiveconfirm:{trip.id}")],
+                [InlineKeyboardButton("لغو", callback_data=f"tripadmin:view:{trip.id}")],
+            ]),
+        )
+    elif action == "archiveconfirm":
+        trip = await db.archive_trip(int(parts[2]))
+        await query.message.reply_text(
+            f"✅ سفر «{trip.title}» آرشیو شد." if trip else "سفر پیدا نشد یا قبلاً آرشیو شده است.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ سفرها", callback_data="admin:trips")]]),
+        )
+    elif action == "restore":
+        trip = await db.restore_trip(int(parts[2]))
+        if not trip:
+            await query.message.reply_text("این سفر قابل بازیابی نیست؛ ممکن است در سفر دیگری ادغام شده باشد.")
+            return
+        await query.message.reply_text(
+            f"♻️ سفر «{trip.title}» بازیابی شد و امتیاز حضورهای تأییدشده دوباره اعمال شد.",
+            reply_markup=_trip_actions_keyboard(trip),
+        )
+    elif action == "merge":
+        source = await db.get_trip(int(parts[2]))
+        if not source:
+            await query.message.reply_text("سفر پیدا نشد.")
+            return
+        candidates = [t for t in await db.list_trips(limit=50) if t.id != source.id]
+        similar = await db.find_similar_trips(source.title, source.start_date_text, source.end_date_text, source.trip_type, exclude_trip_id=source.id, limit=50)
+        similar_ids = {t.id for t in similar}
+        candidates.sort(key=lambda t: (0 if t.id in similar_ids else 1, -t.id))
+        rows = []
+        for target in candidates[:25]:
+            marker = "⭐ " if target.id in similar_ids else ""
+            rows.append([InlineKeyboardButton(
+                f"{marker}{target.title} | {target.trip_code}"[:60],
+                callback_data=f"tripadmin:mergetarget:{source.id}:{target.id}",
+            )])
+        rows.append([InlineKeyboardButton("لغو", callback_data=f"tripadmin:view:{source.id}")])
+        await query.message.reply_text(
+            f"🔀 سفر مقصد برای ادغام «{source.title}» را انتخاب کنید.\n⭐ موارد مشابه بالاتر نمایش داده شده‌اند.",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    elif action == "mergetarget":
+        source_id, target_id = int(parts[2]), int(parts[3])
+        source, target = await db.get_trip(source_id), await db.get_trip(target_id)
+        if not source or not target:
+            await query.message.reply_text("یکی از سفرها پیدا نشد.")
+            return
+        await query.message.reply_text(
+            f"⚠️ ادغام نهایی؟\n\nاز: {source.title} | {source.trip_code}\nبه: {target.title} | {target.trip_code}\n\n"
+            "مسافران یکی می‌شوند، امتیاز تکراری حذف می‌شود و سفر اول آرشیو خواهد شد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ تأیید ادغام", callback_data=f"tripadmin:mergeconfirm:{source_id}:{target_id}")],
+                [InlineKeyboardButton("لغو", callback_data=f"tripadmin:view:{source_id}")],
+            ]),
+        )
+    elif action == "mergeconfirm":
+        source_id, target_id = int(parts[2]), int(parts[3])
+        result = await db.merge_trips(source_id, target_id)
+        if not result:
+            await query.message.reply_text("ادغام انجام نشد؛ وضعیت سفرها را بررسی کنید.")
+            return
+        warning = "\n⚠️ هر دو سفر گروه جدا داشتند؛ گروه سفر مبدأ از رکورد آرشیوی جدا شد." if result["source_group_detached"] else ""
+        await query.message.reply_text(
+            f"✅ «{result['source_title']}» در «{result['target_title']}» ادغام شد.\n"
+            f"👤 مسافر واقعی منتقل‌شده: {result['moved_real']}\n📝 مسافر موقت: {result['moved_guests']}\n"
+            f"⭐ اصلاح خالص امتیازها: {result['points_delta']}{warning}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("مشاهده سفر مقصد", callback_data=f"tripadmin:view:{target_id}")]]),
+        )
+    elif action == "view":
         trip = await db.get_trip(int(parts[2]))
         if not trip:
             await query.message.reply_text("سفر پیدا نشد.")
