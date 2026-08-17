@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import re
 from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, Text, func, inspect, or_, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -107,7 +108,7 @@ class Trip(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trip_code: Mapped[str | None] = mapped_column(String(24), unique=True, nullable=True, index=True)
-    telegram_chat_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, index=True, nullable=True)
     title: Mapped[str] = mapped_column(String(200))
     trip_type: Mapped[str] = mapped_column(String(24), default="domestic_multi", index=True)
     points_value: Mapped[int] = mapped_column(Integer, default=15)
@@ -137,6 +138,54 @@ class TripParticipant(Base):
     )
     points_awarded: Mapped[bool] = mapped_column(Boolean, default=False)
     awarded_points: Mapped[int] = mapped_column(Integer, default=0)
+
+
+def _normalize_name(value: str) -> str:
+    value = (value or "").strip().replace("ي", "ی").replace("ك", "ک")
+    value = re.sub(r"\s+", " ", value)
+    return value.casefold()
+
+
+def _normalize_phone(value: str | None) -> str | None:
+    if not value:
+        return None
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if digits.startswith("98") and len(digits) >= 12:
+        digits = "0" + digits[2:]
+    if len(digits) == 10 and digits.startswith("9"):
+        digits = "0" + digits
+    return digits or None
+
+
+class GuestTraveler(Base):
+    __tablename__ = "guest_travelers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    full_name: Mapped[str] = mapped_column(String(160), index=True)
+    normalized_name: Mapped[str] = mapped_column(String(180), index=True)
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    normalized_phone: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    linked_telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    created_by_telegram_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    linked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class GuestTripParticipant(Base):
+    __tablename__ = "guest_trip_participants"
+
+    trip_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    guest_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="declared", index=True)
+    pending_points: Mapped[int] = mapped_column(Integer, default=0)
+    declared_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
 
 
 class Database:
@@ -251,6 +300,12 @@ class Database:
         tables = inspector.get_table_names()
         if "trips" in tables:
             existing = {column["name"] for column in inspector.get_columns("trips")}
+            # Manual trips can exist without a Telegram group. Railway uses PostgreSQL,
+            # where dropping NOT NULL is safe and idempotent.
+            if sync_conn.dialect.name == "postgresql":
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trips ALTER COLUMN telegram_chat_id DROP NOT NULL"
+                )
             if "trip_type" not in existing:
                 sync_conn.exec_driver_sql(
                     "ALTER TABLE trips ADD COLUMN trip_type VARCHAR(24) DEFAULT 'domestic_multi' NOT NULL"
@@ -703,6 +758,218 @@ class Database:
             await session.commit()
             await session.refresh(trip)
             return trip
+
+    async def create_manual_trip(
+        self,
+        title: str,
+        start_date_text: str,
+        end_date_text: str,
+        trip_type: str,
+        created_by_telegram_id: int,
+    ) -> Trip:
+        now = datetime.now(timezone.utc)
+        async with self.sessions() as session:
+            trip = Trip(
+                telegram_chat_id=None,
+                title=title.strip(),
+                trip_type=trip_type,
+                points_value=TRIP_POINTS.get(trip_type, 0),
+                start_date_text=start_date_text.strip(),
+                end_date_text=end_date_text.strip(),
+                created_by_telegram_id=created_by_telegram_id,
+                status="open",
+                updated_at=now,
+            )
+            session.add(trip)
+            await session.flush()
+            trip.trip_code = f"TRIP-{trip.id:05d}"
+            await session.commit()
+            await session.refresh(trip)
+            return trip
+
+    async def find_exact_user(self, full_name: str, phone: str | None = None) -> User | None:
+        normalized_phone = _normalize_phone(phone)
+        normalized_name = _normalize_name(full_name)
+        async with self.sessions() as session:
+            if normalized_phone:
+                result = await session.execute(select(User))
+                phone_matches = [u for u in result.scalars().all() if _normalize_phone(u.phone) == normalized_phone]
+                if len(phone_matches) == 1:
+                    return phone_matches[0]
+            result = await session.execute(select(User))
+            name_matches = [u for u in result.scalars().all() if _normalize_name(u.full_name) == normalized_name]
+            return name_matches[0] if len(name_matches) == 1 else None
+
+    async def create_or_get_guest(
+        self, full_name: str, phone: str | None, created_by_telegram_id: int
+    ) -> GuestTraveler:
+        normalized_name = _normalize_name(full_name)
+        normalized_phone = _normalize_phone(phone)
+        async with self.sessions() as session:
+            conditions = [
+                GuestTraveler.linked_telegram_id.is_(None),
+                GuestTraveler.normalized_name == normalized_name,
+            ]
+            if normalized_phone:
+                conditions.append(GuestTraveler.normalized_phone == normalized_phone)
+            result = await session.execute(select(GuestTraveler).where(*conditions).order_by(GuestTraveler.id.asc()))
+            guest = result.scalars().first()
+            if guest:
+                if phone and not guest.phone:
+                    guest.phone = phone
+                    guest.normalized_phone = normalized_phone
+                    await session.commit()
+                return guest
+            guest = GuestTraveler(
+                full_name=full_name.strip(),
+                normalized_name=normalized_name,
+                phone=phone.strip() if phone else None,
+                normalized_phone=normalized_phone,
+                created_by_telegram_id=created_by_telegram_id,
+            )
+            session.add(guest)
+            await session.commit()
+            await session.refresh(guest)
+            return guest
+
+    async def get_guest(self, guest_id: int) -> GuestTraveler | None:
+        async with self.sessions() as session:
+            return await session.get(GuestTraveler, guest_id)
+
+    async def register_guest_trip_participant(
+        self, trip_id: int, guest_id: int, status: str = "attended"
+    ) -> GuestTripParticipant:
+        now = datetime.now(timezone.utc)
+        async with self.sessions() as session:
+            item = await session.get(GuestTripParticipant, (trip_id, guest_id))
+            trip = await session.get(Trip, trip_id)
+            pending = int(trip.points_value or 0) if trip and status == "attended" else 0
+            if item:
+                item.status = status
+                item.pending_points = pending
+                item.updated_at = now
+            else:
+                item = GuestTripParticipant(
+                    trip_id=trip_id, guest_id=guest_id, status=status,
+                    pending_points=pending, updated_at=now
+                )
+                session.add(item)
+            await session.commit()
+            await session.refresh(item)
+            return item
+
+    async def set_guest_trip_participant_status(
+        self, trip_id: int, guest_id: int, status: str
+    ) -> GuestTripParticipant | None:
+        async with self.sessions() as session:
+            item = await session.get(GuestTripParticipant, (trip_id, guest_id))
+            if not item:
+                return None
+            trip = await session.get(Trip, trip_id)
+            item.status = status
+            item.pending_points = int(trip.points_value or 0) if trip and status == "attended" else 0
+            item.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            await session.refresh(item)
+            return item
+
+    async def list_guest_trip_participants(
+        self, trip_id: int
+    ) -> list[tuple[GuestTripParticipant, GuestTraveler]]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(GuestTripParticipant, GuestTraveler)
+                .join(GuestTraveler, GuestTraveler.id == GuestTripParticipant.guest_id)
+                .where(GuestTripParticipant.trip_id == trip_id)
+                .order_by(GuestTripParticipant.declared_at.asc())
+            )
+            return list(result.all())
+
+    async def list_unlinked_guests(self, limit: int = 200) -> list[GuestTraveler]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(GuestTraveler)
+                .where(GuestTraveler.linked_telegram_id.is_(None))
+                .order_by(GuestTraveler.created_at.desc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def find_guest_match_candidates(
+        self, full_name: str, phone: str | None = None, limit: int = 10
+    ) -> list[GuestTraveler]:
+        normalized_name = _normalize_name(full_name)
+        normalized_phone = _normalize_phone(phone)
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(GuestTraveler)
+                .where(GuestTraveler.linked_telegram_id.is_(None))
+                .order_by(GuestTraveler.created_at.asc())
+            )
+            guests = list(result.scalars().all())
+        matches = []
+        for guest in guests:
+            phone_match = bool(normalized_phone and guest.normalized_phone == normalized_phone)
+            name_match = guest.normalized_name == normalized_name
+            if phone_match or name_match:
+                matches.append(guest)
+            if len(matches) >= limit:
+                break
+        return matches
+
+    async def link_guest_to_user(self, guest_id: int, telegram_id: int) -> dict | None:
+        async with self.sessions() as session:
+            guest = await session.get(GuestTraveler, guest_id)
+            user_result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+            user = user_result.scalar_one_or_none()
+            if not guest or not user or guest.linked_telegram_id is not None:
+                return None
+            rows = await session.execute(
+                select(GuestTripParticipant, Trip)
+                .join(Trip, Trip.id == GuestTripParticipant.trip_id)
+                .where(GuestTripParticipant.guest_id == guest_id)
+                .order_by(GuestTripParticipant.declared_at.asc())
+            )
+            points_added = 0
+            linked_trips = []
+            for guest_participant, trip in rows.all():
+                participant = await session.get(TripParticipant, (trip.id, telegram_id))
+                if participant is None:
+                    participant = TripParticipant(
+                        trip_id=trip.id, telegram_id=telegram_id, status=guest_participant.status,
+                        declared_at=guest_participant.declared_at, updated_at=datetime.now(timezone.utc),
+                        points_awarded=False, awarded_points=0,
+                    )
+                    session.add(participant)
+                    await session.flush()
+                elif participant.status != "attended" and guest_participant.status == "attended":
+                    participant.status = "attended"
+                    participant.updated_at = datetime.now(timezone.utc)
+
+                if participant.status == "attended" and not participant.points_awarded:
+                    points = int(trip.points_value or TRIP_POINTS.get(trip.trip_type, 0))
+                    user.points += points
+                    participant.points_awarded = True
+                    participant.awarded_points = points
+                    points_added += points
+                    session.add(Activity(
+                        telegram_id=telegram_id, activity_type="trip_attended",
+                        title=f"شرکت در سفر {trip.title}",
+                        details=f"{trip.trip_code} | +{points} امتیاز | اتصال سابقه دستی",
+                    ))
+                linked_trips.append(trip.title)
+                await session.delete(guest_participant)
+
+            guest.linked_telegram_id = telegram_id
+            guest.linked_at = datetime.now(timezone.utc)
+            await session.commit()
+            return {
+                "guest_name": guest.full_name,
+                "user_name": user.full_name,
+                "trip_titles": linked_trips,
+                "points_added": points_added,
+                "total_points": user.points,
+            }
 
     async def get_trip_by_chat_id(self, telegram_chat_id: int) -> Trip | None:
         async with self.sessions() as session:
