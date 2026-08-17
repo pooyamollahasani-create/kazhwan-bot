@@ -115,6 +115,11 @@ class Trip(Base):
     start_date_text: Mapped[str] = mapped_column(String(80))
     end_date_text: Mapped[str] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    pre_archive_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    merged_into_trip_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     created_by_telegram_id: Mapped[int] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
@@ -330,6 +335,33 @@ class Database:
             )
             sync_conn.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_trips_trip_type ON trips (trip_type)"
+            )
+            existing = {column["name"] for column in inspect(sync_conn).get_columns("trips")}
+            if "archived" not in existing:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trips ADD COLUMN archived BOOLEAN DEFAULT FALSE NOT NULL"
+                )
+            if "archived_at" not in existing:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trips ADD COLUMN archived_at TIMESTAMP"
+                )
+            if "archived_chat_id" not in existing:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trips ADD COLUMN archived_chat_id BIGINT"
+                )
+            if "pre_archive_status" not in existing:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trips ADD COLUMN pre_archive_status VARCHAR(20)"
+                )
+            if "merged_into_trip_id" not in existing:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE trips ADD COLUMN merged_into_trip_id INTEGER"
+                )
+            sync_conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_trips_archived ON trips (archived)"
+            )
+            sync_conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_trips_merged_into_trip_id ON trips (merged_into_trip_id)"
             )
 
         if "trip_participants" in tables:
@@ -715,6 +747,34 @@ class Database:
             )
             return list(result.scalars().all())
 
+    async def find_similar_trips(
+        self, title: str, start_date_text: str, end_date_text: str, trip_type: str,
+        exclude_trip_id: int | None = None, limit: int = 10,
+    ) -> list[Trip]:
+        """Find likely duplicate trips using normalized title + dates + type."""
+        wanted_title = _normalize_name(title)
+        wanted_start = _normalize_name(start_date_text)
+        wanted_end = _normalize_name(end_date_text)
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(Trip).where(Trip.archived.is_(False)).order_by(Trip.created_at.desc())
+            )
+            trips = list(result.scalars().all())
+        matches = []
+        for trip in trips:
+            if exclude_trip_id is not None and trip.id == exclude_trip_id:
+                continue
+            if (
+                _normalize_name(trip.title) == wanted_title
+                and _normalize_name(trip.start_date_text) == wanted_start
+                and _normalize_name(trip.end_date_text) == wanted_end
+                and trip.trip_type == trip_type
+            ):
+                matches.append(trip)
+                if len(matches) >= limit:
+                    break
+        return matches
+
     async def create_or_update_trip(
         self,
         telegram_chat_id: int,
@@ -728,7 +788,10 @@ class Database:
         points_value = TRIP_POINTS.get(trip_type, 0)
         async with self.sessions() as session:
             result = await session.execute(
-                select(Trip).where(Trip.telegram_chat_id == telegram_chat_id)
+                select(Trip).where(
+                    Trip.telegram_chat_id == telegram_chat_id,
+                    Trip.archived.is_(False),
+                )
             )
             trip = result.scalar_one_or_none()
             if trip:
@@ -750,6 +813,7 @@ class Database:
                     end_date_text=end_date_text,
                     created_by_telegram_id=created_by_telegram_id,
                     status="open",
+                    archived=False,
                     updated_at=now,
                 )
                 session.add(trip)
@@ -778,11 +842,37 @@ class Database:
                 end_date_text=end_date_text.strip(),
                 created_by_telegram_id=created_by_telegram_id,
                 status="open",
+                archived=False,
                 updated_at=now,
             )
             session.add(trip)
             await session.flush()
             trip.trip_code = f"TRIP-{trip.id:05d}"
+            await session.commit()
+            await session.refresh(trip)
+            return trip
+
+    async def link_trip_to_chat(self, trip_id: int, telegram_chat_id: int) -> Trip | None:
+        """Attach a Telegram group to an existing trip without creating a duplicate."""
+        async with self.sessions() as session:
+            trip = await session.get(Trip, trip_id)
+            if not trip or trip.archived:
+                return None
+            result = await session.execute(
+                select(Trip).where(
+                    Trip.telegram_chat_id == telegram_chat_id,
+                    Trip.id != trip_id,
+                    Trip.archived.is_(False),
+                )
+            )
+            old = result.scalar_one_or_none()
+            if old:
+                old.telegram_chat_id = None
+                old.updated_at = datetime.now(timezone.utc)
+            # A single trip currently has one primary Telegram group. If it was
+            # linked elsewhere, the new group becomes the primary group.
+            trip.telegram_chat_id = telegram_chat_id
+            trip.updated_at = datetime.now(timezone.utc)
             await session.commit()
             await session.refresh(trip)
             return trip
@@ -974,7 +1064,10 @@ class Database:
     async def get_trip_by_chat_id(self, telegram_chat_id: int) -> Trip | None:
         async with self.sessions() as session:
             result = await session.execute(
-                select(Trip).where(Trip.telegram_chat_id == telegram_chat_id)
+                select(Trip).where(
+                    Trip.telegram_chat_id == telegram_chat_id,
+                    Trip.archived.is_(False),
+                )
             )
             return result.scalar_one_or_none()
 
@@ -985,7 +1078,20 @@ class Database:
     async def list_trips(self, limit: int = 100) -> list[Trip]:
         async with self.sessions() as session:
             result = await session.execute(
-                select(Trip).order_by(Trip.created_at.desc()).limit(limit)
+                select(Trip)
+                .where(Trip.archived.is_(False))
+                .order_by(Trip.created_at.desc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def list_archived_trips(self, limit: int = 100) -> list[Trip]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(Trip)
+                .where(Trip.archived.is_(True))
+                .order_by(Trip.archived_at.desc(), Trip.created_at.desc())
+                .limit(limit)
             )
             return list(result.scalars().all())
 
@@ -999,6 +1105,183 @@ class Database:
             await session.commit()
             await session.refresh(trip)
             return trip
+
+    async def archive_trip(self, trip_id: int) -> Trip | None:
+        """Soft-delete a trip and reverse points awarded only by this trip."""
+        async with self.sessions() as session:
+            trip = await session.get(Trip, trip_id)
+            if not trip or trip.archived:
+                return trip
+            now = datetime.now(timezone.utc)
+            rows = await session.execute(
+                select(TripParticipant).where(TripParticipant.trip_id == trip_id)
+            )
+            for participant in rows.scalars().all():
+                if participant.points_awarded and participant.awarded_points:
+                    user_result = await session.execute(
+                        select(User).where(User.telegram_id == participant.telegram_id)
+                    )
+                    user = user_result.scalar_one_or_none()
+                    if user:
+                        user.points = max(0, user.points - int(participant.awarded_points or 0))
+                    participant.points_awarded = False
+                    participant.awarded_points = 0
+            guest_rows = await session.execute(
+                select(GuestTripParticipant).where(GuestTripParticipant.trip_id == trip_id)
+            )
+            for participant in guest_rows.scalars().all():
+                participant.pending_points = 0
+            trip.pre_archive_status = trip.status if trip.status != "archived" else (trip.pre_archive_status or "closed")
+            trip.status = "archived"
+            trip.archived = True
+            trip.archived_at = now
+            trip.archived_chat_id = trip.telegram_chat_id
+            trip.telegram_chat_id = None
+            trip.updated_at = now
+            await session.commit()
+            await session.refresh(trip)
+            return trip
+
+    async def restore_trip(self, trip_id: int) -> Trip | None:
+        """Restore an archived non-merged trip and reapply attended points once."""
+        async with self.sessions() as session:
+            trip = await session.get(Trip, trip_id)
+            if not trip or not trip.archived or trip.merged_into_trip_id is not None:
+                return None
+            trip.archived = False
+            trip.archived_at = None
+            trip.status = trip.pre_archive_status or "closed"
+            trip.pre_archive_status = None
+            if trip.archived_chat_id is not None:
+                conflict = await session.execute(
+                    select(Trip).where(
+                        Trip.telegram_chat_id == trip.archived_chat_id,
+                        Trip.id != trip.id,
+                        Trip.archived.is_(False),
+                    )
+                )
+                if conflict.scalar_one_or_none() is None:
+                    trip.telegram_chat_id = trip.archived_chat_id
+            trip.archived_chat_id = None
+            trip.updated_at = datetime.now(timezone.utc)
+            rows = await session.execute(
+                select(TripParticipant).where(TripParticipant.trip_id == trip_id)
+            )
+            for participant in rows.scalars().all():
+                if participant.status == "attended" and not participant.points_awarded:
+                    user_result = await session.execute(
+                        select(User).where(User.telegram_id == participant.telegram_id)
+                    )
+                    user = user_result.scalar_one_or_none()
+                    if user:
+                        points = int(trip.points_value or TRIP_POINTS.get(trip.trip_type, 0))
+                        user.points += points
+                        participant.points_awarded = True
+                        participant.awarded_points = points
+            guest_rows = await session.execute(
+                select(GuestTripParticipant).where(GuestTripParticipant.trip_id == trip_id)
+            )
+            for participant in guest_rows.scalars().all():
+                participant.pending_points = int(trip.points_value or 0) if participant.status == "attended" else 0
+            await session.commit()
+            await session.refresh(trip)
+            return trip
+
+    async def merge_trips(self, source_trip_id: int, target_trip_id: int) -> dict | None:
+        """Merge a duplicate source trip into target, preserving people and de-duplicating points."""
+        if source_trip_id == target_trip_id:
+            return None
+        priority = {"cancelled": 0, "declared": 1, "attended": 2}
+        async with self.sessions() as session:
+            source = await session.get(Trip, source_trip_id)
+            target = await session.get(Trip, target_trip_id)
+            if not source or not target or source.archived or target.archived:
+                return None
+            source_chat = source.telegram_chat_id
+            target_chat = target.telegram_chat_id
+
+            real_rows = await session.execute(
+                select(TripParticipant).where(TripParticipant.trip_id == source_trip_id)
+            )
+            moved_real = 0
+            adjusted_points = 0
+            for sp in list(real_rows.scalars().all()):
+                tp = await session.get(TripParticipant, (target_trip_id, sp.telegram_id))
+                old_awarded = int(sp.awarded_points or 0) if sp.points_awarded else 0
+                if tp is not None and tp.points_awarded:
+                    old_awarded += int(tp.awarded_points or 0)
+                merged_status = sp.status
+                if tp is not None and priority.get(tp.status, 0) >= priority.get(sp.status, 0):
+                    merged_status = tp.status
+                if tp is None:
+                    tp = TripParticipant(
+                        trip_id=target_trip_id, telegram_id=sp.telegram_id, status=merged_status,
+                        declared_at=sp.declared_at, updated_at=datetime.now(timezone.utc),
+                        points_awarded=False, awarded_points=0,
+                    )
+                    session.add(tp)
+                    await session.flush()
+                else:
+                    tp.status = merged_status
+                    tp.updated_at = datetime.now(timezone.utc)
+                    if sp.declared_at and (not tp.declared_at or sp.declared_at < tp.declared_at):
+                        tp.declared_at = sp.declared_at
+                desired = int(target.points_value or 0) if merged_status == "attended" else 0
+                user_result = await session.execute(select(User).where(User.telegram_id == sp.telegram_id))
+                user = user_result.scalar_one_or_none()
+                delta = desired - old_awarded
+                if user and delta:
+                    user.points = max(0, user.points + delta)
+                    adjusted_points += delta
+                tp.points_awarded = desired > 0
+                tp.awarded_points = desired
+                await session.delete(sp)
+                moved_real += 1
+
+            guest_rows = await session.execute(
+                select(GuestTripParticipant).where(GuestTripParticipant.trip_id == source_trip_id)
+            )
+            moved_guests = 0
+            for sp in list(guest_rows.scalars().all()):
+                tp = await session.get(GuestTripParticipant, (target_trip_id, sp.guest_id))
+                merged_status = sp.status
+                if tp is not None and priority.get(tp.status, 0) >= priority.get(sp.status, 0):
+                    merged_status = tp.status
+                if tp is None:
+                    tp = GuestTripParticipant(
+                        trip_id=target_trip_id, guest_id=sp.guest_id, status=merged_status,
+                        pending_points=int(target.points_value or 0) if merged_status == "attended" else 0,
+                        declared_at=sp.declared_at, updated_at=datetime.now(timezone.utc),
+                    )
+                    session.add(tp)
+                else:
+                    tp.status = merged_status
+                    tp.pending_points = int(target.points_value or 0) if merged_status == "attended" else 0
+                    tp.updated_at = datetime.now(timezone.utc)
+                    if sp.declared_at and (not tp.declared_at or sp.declared_at < tp.declared_at):
+                        tp.declared_at = sp.declared_at
+                await session.delete(sp)
+                moved_guests += 1
+
+            # Prefer an existing target group; otherwise inherit the source group.
+            if target.telegram_chat_id is None and source_chat is not None:
+                target.telegram_chat_id = source_chat
+            source.archived_chat_id = source_chat
+            source.telegram_chat_id = None
+            source.pre_archive_status = source.status
+            source.status = "archived"
+            source.archived = True
+            source.archived_at = datetime.now(timezone.utc)
+            source.merged_into_trip_id = target_trip_id
+            source.updated_at = datetime.now(timezone.utc)
+            target.updated_at = datetime.now(timezone.utc)
+            await session.commit()
+            return {
+                "source_title": source.title, "target_title": target.title,
+                "moved_real": moved_real, "moved_guests": moved_guests,
+                "points_delta": adjusted_points,
+                "source_group_detached": bool(source_chat and target_chat and source_chat != target_chat),
+            }
 
     async def register_trip_participant(self, trip_id: int, telegram_id: int) -> TripParticipant:
         now = datetime.now(timezone.utc)
@@ -1102,7 +1385,10 @@ class Database:
             result = await session.execute(
                 select(TripParticipant, Trip)
                 .join(Trip, Trip.id == TripParticipant.trip_id)
-                .where(TripParticipant.telegram_id == telegram_id)
+                .where(
+                    TripParticipant.telegram_id == telegram_id,
+                    Trip.archived.is_(False),
+                )
                 .order_by(Trip.created_at.desc())
             )
             return list(result.all())
@@ -1113,6 +1399,7 @@ class Database:
             result = await session.execute(
                 select(TripParticipant, Trip)
                 .join(Trip, Trip.id == TripParticipant.trip_id)
+                .where(Trip.archived.is_(False))
                 .order_by(TripParticipant.telegram_id.asc(), Trip.created_at.asc())
             )
             return list(result.all())
