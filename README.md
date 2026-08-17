@@ -192,3 +192,7 @@ Trip passengers only need a Kazhwan profile and membership in `@Kazhwantravel`; 
 ## v1.5 — ثبت دستی سفر و مسافر
 
 در پنل خصوصی مدیر (`/admin → مدیریت سفرها`) می‌توان سفر جدیدی بدون گروه تلگرام ساخت و از داخل هر سفر «افزودن مسافر دستی» را انتخاب کرد. نام و نام خانوادگی الزامی و شماره موبایل اختیاری است. اگر پروفایل کژوان پیدا نشود، سابقه به‌عنوان مسافر موقت ذخیره می‌شود و امتیاز سفر تا زمان اتصال به پروفایل واقعی معوق می‌ماند.
+
+
+## v1.6 — Trip data hygiene
+Duplicate prevention, group-to-existing-trip linking, merge, archive/restore, and strict scoped command menus.
