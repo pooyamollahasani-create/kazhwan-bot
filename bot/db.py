@@ -101,6 +101,9 @@ class GroupModerationState(Base):
 
     group_chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     saved_permissions_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    quiet_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    quiet_start: Mapped[str] = mapped_column(String(5), default="23:00")
+    quiet_end: Mapped[str] = mapped_column(String(5), default="11:00")
 
 
 class Trip(Base):
@@ -203,6 +206,7 @@ class Database:
             await conn.run_sync(Base.metadata.create_all)
             await conn.run_sync(self._migrate_users_table)
             await conn.run_sync(self._migrate_trips_table)
+            await conn.run_sync(self._migrate_group_moderation_table)
 
         # Backfill referral codes for users that existed before this version.
         async with self.sessions() as session:
@@ -297,6 +301,26 @@ class Database:
             "ON users (referred_by_telegram_id)"
         )
 
+
+    @staticmethod
+    def _migrate_group_moderation_table(sync_conn) -> None:
+        """Persist quiet-hour settings so admins can change them without a deploy."""
+        inspector = inspect(sync_conn)
+        if "group_moderation_state" not in inspector.get_table_names():
+            return
+        existing = {c["name"] for c in inspector.get_columns("group_moderation_state")}
+        if "quiet_enabled" not in existing:
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE group_moderation_state ADD COLUMN quiet_enabled BOOLEAN DEFAULT TRUE NOT NULL"
+            )
+        if "quiet_start" not in existing:
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE group_moderation_state ADD COLUMN quiet_start VARCHAR(5) DEFAULT '23:00' NOT NULL"
+            )
+        if "quiet_end" not in existing:
+            sync_conn.exec_driver_sql(
+                "ALTER TABLE group_moderation_state ADD COLUMN quiet_end VARCHAR(5) DEFAULT '11:00' NOT NULL"
+            )
 
     @staticmethod
     def _migrate_trips_table(sync_conn) -> None:
@@ -642,6 +666,45 @@ class Database:
                 membership.rules_accepted = True
                 membership.status = "active"
             await session.commit()
+
+    async def get_quiet_settings(self, group_chat_id: int) -> dict:
+        async with self.sessions() as session:
+            state = await session.get(GroupModerationState, group_chat_id)
+            if not state:
+                state = GroupModerationState(
+                    group_chat_id=group_chat_id, quiet_enabled=True, quiet_start="23:00", quiet_end="11:00"
+                )
+                session.add(state)
+                await session.commit()
+                await session.refresh(state)
+            return {
+                "enabled": bool(state.quiet_enabled),
+                "start": state.quiet_start or "23:00",
+                "end": state.quiet_end or "11:00",
+            }
+
+    async def update_quiet_settings(self, group_chat_id: int, *, enabled=None, start=None, end=None) -> dict:
+        async with self.sessions() as session:
+            state = await session.get(GroupModerationState, group_chat_id)
+            if not state:
+                state = GroupModerationState(group_chat_id=group_chat_id)
+                session.add(state)
+            if enabled is not None:
+                state.quiet_enabled = bool(enabled)
+            if start is not None:
+                state.quiet_start = start
+            if end is not None:
+                state.quiet_end = end
+            await session.commit()
+            await session.refresh(state)
+            return {"enabled": bool(state.quiet_enabled), "start": state.quiet_start, "end": state.quiet_end}
+
+    async def count_btc_users(self) -> int:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(func.count(BtcMembership.id)).where(BtcMembership.status == "active")
+            )
+            return int(result.scalar_one())
 
     async def get_saved_group_permissions(self, group_chat_id: int) -> str | None:
         async with self.sessions() as session:
