@@ -11,13 +11,18 @@ from bot.handlers.admin import is_admin
 logger = logging.getLogger(__name__)
 
 IRAN_TZ = timezone(timedelta(hours=3, minutes=30), name="Iran")
-QUIET_START = time(23, 0, tzinfo=IRAN_TZ)
-QUIET_END = time(11, 0, tzinfo=IRAN_TZ)
+def _parse_hhmm(value: str) -> time:
+    hour, minute = (int(x) for x in value.split(":", 1))
+    return time(hour, minute)
 
 
-def _is_quiet_now() -> bool:
-    now = datetime.now(IRAN_TZ).time().replace(tzinfo=None)
-    return now >= time(23, 0) or now < time(11, 0)
+def _is_quiet_at(now: time, start: time, end: time) -> bool:
+    # Supports both overnight windows (23:00 -> 11:00) and same-day windows.
+    if start == end:
+        return False
+    if start < end:
+        return start <= now < end
+    return now >= start or now < end
 
 
 
@@ -113,8 +118,16 @@ async def enforce_quiet_hours(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not settings.group_chat_id:
         return
     db = context.application.bot_data["db"]
-    if _is_quiet_now():
-        await lock_group(context)
+    quiet = await db.get_quiet_settings(settings.group_chat_id)
+    if not quiet["enabled"]:
+        if await db.get_saved_group_permissions(settings.group_chat_id):
+            await unlock_group(context)
+        return
+    now = datetime.now(IRAN_TZ).time().replace(tzinfo=None)
+    should_lock = _is_quiet_at(now, _parse_hhmm(quiet["start"]), _parse_hhmm(quiet["end"]))
+    if should_lock:
+        if not await db.get_saved_group_permissions(settings.group_chat_id):
+            await lock_group(context)
     elif await db.get_saved_group_permissions(settings.group_chat_id):
         await unlock_group(context)
 
@@ -134,49 +147,23 @@ async def quiet_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def initialize_quiet_hours(application) -> None:
-    """Schedule daily lock/unlock and repair state after a Railway restart."""
+    """Use DB-backed quiet hours; watchdog applies changes without a redeploy."""
     settings = application.bot_data["settings"]
     if not settings.group_chat_id:
         logger.warning("Quiet hours not scheduled because GROUP_CHAT_ID is empty")
         return
-
     if application.job_queue is None:
-        raise RuntimeError(
-            "JobQueue is unavailable. Install python-telegram-bot with the job-queue extra."
-        )
+        raise RuntimeError("JobQueue is unavailable. Install python-telegram-bot with the job-queue extra.")
 
-    application.job_queue.run_daily(
-        lock_group,
-        time=QUIET_START,
-        name="kazhwan_quiet_start",
-    )
-    application.job_queue.run_daily(
-        unlock_group,
-        time=QUIET_END,
-        name="kazhwan_quiet_end",
-    )
     application.job_queue.run_repeating(
-        enforce_quiet_hours,
-        interval=300,
-        first=60,
-        name="kazhwan_quiet_watchdog",
+        enforce_quiet_hours, interval=60, first=5, name="kazhwan_quiet_watchdog"
     )
 
-    # If Railway restarts at night, the group should still remain closed;
-    # if it restarts during daytime, ensure it is open.
     class StartupContext:
         def __init__(self, app):
             self.application = app
             self.bot = app.bot
-
-    startup_context = StartupContext(application)
-    if _is_quiet_now():
-        await lock_group(startup_context)
-    else:
-        # Only restore if a previous night-lock snapshot exists.
-        db = application.bot_data["db"]
-        if await db.get_saved_group_permissions(settings.group_chat_id):
-            await unlock_group(startup_context)
+    await enforce_quiet_hours(StartupContext(application))
 
 
 async def track_group_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -225,6 +212,10 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             username=member.username,
             display_name=member.full_name,
         )
+        # A member may enter via invite/manual approval instead of the onboarding Join Request.
+        # If a KZH profile already exists, synchronize BTC membership here too.
+        if await db.get_user(member.id):
+            await db.mark_existing_group_member(member.id)
         await context.bot.send_message(
             chat_id=change.chat.id,
             text=f"🌿 {member.full_name} عزیز، به گروه خوش اومدی.",
