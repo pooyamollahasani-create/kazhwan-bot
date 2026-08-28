@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 MANUAL_TRIP_TITLE, MANUAL_TRIP_TYPE, MANUAL_TRIP_START, MANUAL_TRIP_END, MANUAL_GUEST_NAME, MANUAL_GUEST_PHONE, MANUAL_GUEST_STATUS, MANUAL_TRIP_DUPLICATE = range(100, 108)
 QUIET_START_INPUT, QUIET_END_INPUT = range(200, 202)
+MEMBER_SEARCH_INPUT = 300
 
 
 STATUS_LABELS = {
@@ -78,7 +79,7 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📝 مسافران موقت", callback_data="admin:guests"),
-            InlineKeyboardButton("🔎 جستجوی عضو", callback_data="admin:memberhelp"),
+            InlineKeyboardButton("🔎 جستجوی اعضا", callback_data="admin:membersearch"),
         ],
     ])
 
@@ -351,6 +352,156 @@ async def member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "—",
         ])
     await update.effective_message.reply_text("\n".join(lines))
+
+
+async def member_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id, context):
+        return ConversationHandler.END
+    await query.answer()
+    await query.message.reply_text(
+        "🔎 جستجوی اعضا\n\n"
+        "نام و نام خانوادگی، شماره تماس، @آیدی تلگرام، کد KZH/BTC یا Telegram ID را بفرستید.\n\n"
+        "مثال:\nپویا ملاحسنی\n0912...\n@username\nKZH-000012"
+    )
+    return MEMBER_SEARCH_INPUT
+
+
+async def member_search_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_user or not is_admin(update.effective_user.id, context):
+        return ConversationHandler.END
+    value = (update.effective_message.text or "").strip()
+    if not value:
+        await update.effective_message.reply_text("یک نام، شماره تماس، آیدی یا کد عضویت وارد کنید.")
+        return MEMBER_SEARCH_INPUT
+
+    db = context.application.bot_data["db"]
+    users = await db.search_users(value, limit=15)
+    if not users:
+        await update.effective_message.reply_text(
+            f"❌ برای «{value}» عضوی پیدا نشد.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔎 جستجوی دوباره", callback_data="admin:membersearch")],
+                [InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")],
+            ]),
+        )
+        return ConversationHandler.END
+
+    rows = []
+    for user in users:
+        username = f"@{user.telegram_username}" if user.telegram_username else user.phone
+        label = f"👤 {user.full_name} | {username}"
+        rows.append([InlineKeyboardButton(label[:62], callback_data=f"memberprofile:view:{user.telegram_id}")])
+    rows.append([InlineKeyboardButton("🔎 جستجوی جدید", callback_data="admin:membersearch")])
+    rows.append([InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")])
+    await update.effective_message.reply_text(
+        f"🔎 {len(users)} نتیجه برای «{value}» پیدا شد:\n\nعضو موردنظر را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return ConversationHandler.END
+
+
+def build_member_search_handler() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[CallbackQueryHandler(member_search_start, pattern=r"^admin:membersearch$")],
+        states={
+            MEMBER_SEARCH_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, member_search_receive)],
+        },
+        fallbacks=[CommandHandler("cancel", admin_flow_cancel)],
+        allow_reentry=True,
+    )
+
+
+def _fmt_dt(value) -> str:
+    if not value:
+        return "-"
+    try:
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return str(value)
+
+
+async def member_profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id, context):
+        return
+    await query.answer()
+    parts = query.data.split(":")
+    if len(parts) < 3:
+        return
+    action = parts[1]
+    try:
+        telegram_id = int(parts[2])
+    except ValueError:
+        return
+
+    db = context.application.bot_data["db"]
+    user = await db.get_user(telegram_id)
+    if not user:
+        await query.message.reply_text("این پروفایل دیگر پیدا نشد.")
+        return
+
+    btc = await db.get_btc_membership(telegram_id)
+    trips = await db.list_user_trips(telegram_id)
+
+    if action == "history":
+        if not trips:
+            text = f"🧳 تاریخچه سفرهای {user.full_name}\n\nهنوز سفری برای این پروفایل ثبت نشده است."
+        else:
+            lines = [f"🧳 تاریخچه سفرهای {user.full_name}", ""]
+            for participant, trip in trips[:30]:
+                status = STATUS_LABELS.get(participant.status, participant.status)
+                trip_type = TRIP_TYPE_LABELS.get(trip.trip_type, trip.trip_type)
+                lines.append(f"• {trip.title} | {trip_type} | {status} | {participant.awarded_points or 0} امتیاز")
+            if len(trips) > 30:
+                lines.append(f"\n… و {len(trips)-30} سفر دیگر")
+            text = "\n".join(lines)
+        await query.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ بازگشت به پروفایل", callback_data=f"memberprofile:view:{telegram_id}")],
+                [InlineKeyboardButton("🔎 جستجوی جدید", callback_data="admin:membersearch")],
+            ]),
+        )
+        return
+
+    username = f"@{user.telegram_username}" if user.telegram_username else "-"
+    btc_active = bool(btc and getattr(btc, "status", "active") == "active")
+    btc_code = btc.btc_code if btc else "-"
+    attended = sum(1 for p, _ in trips if p.status == "attended")
+    declared = sum(1 for p, _ in trips if p.status == "declared")
+    cancelled = sum(1 for p, _ in trips if p.status == "cancelled")
+
+    lines = [
+        "👤 پروفایل عضو",
+        "",
+        f"نام: {user.full_name}",
+        f"📱 موبایل: {user.phone}",
+        f"📍 شهر: {user.city}",
+        f"📣 نحوه آشنایی: {user.discovery_source}",
+        "",
+        f"🆔 KZH: {user.member_code or '-'}",
+        f"⛰ عضو BTC: {'✅ بله' if btc_active else '❌ خیر'}",
+        f"🏷 BTC Code: {btc_code}",
+        f"🔗 کد معرف: {user.referral_code or '-'}",
+        "",
+        f"Telegram: {username}",
+        f"Telegram ID: {user.telegram_id}",
+        f"⭐ امتیاز کل: {user.points}",
+        f"👥 معرفی موفق: {user.referral_count}",
+        "",
+        f"🧳 سفرها: {len(trips)} | شرکت‌کرده {attended} | اعلام حضور {declared} | انصراف {cancelled}",
+        f"🕒 آخرین فعالیت: {_fmt_dt(user.last_activity_at)}",
+        f"📅 تاریخ ثبت پروفایل: {_fmt_dt(user.created_at)}",
+    ]
+    await query.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧳 تاریخچه سفرها", callback_data=f"memberprofile:history:{telegram_id}")],
+            [InlineKeyboardButton("🔎 جستجوی جدید", callback_data="admin:membersearch")],
+            [InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")],
+        ]),
+    )
 
 
 async def topreferrals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -844,7 +995,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         headers, rows = await _member_export_rows(db, users)
         await query.message.reply_document(build_xlsx(headers, rows, sheet_name="Members"), filename="kazhwan_all_members.xlsx")
     elif action == "memberhelp":
-        await query.message.reply_text("🔎 جستجوی عضو:\n/member نام یا شماره یا کد عضویت")
+        await query.message.reply_text("🔎 از دکمه «جستجوی اعضا» در پنل استفاده کنید، یا دستور /member را همراه نام، شماره یا کد عضویت بفرستید.")
     elif action == "guests":
         guests = await context.application.bot_data["db"].list_unlinked_guests(limit=50)
         if not guests:
@@ -1132,6 +1283,7 @@ def admin_handlers():
     return [
         build_admin_flow_handler(),
         build_quiet_settings_handler(),
+        build_member_search_handler(),
         CommandHandler("admin", admin_panel), CommandHandler("chatid", chatid), CommandHandler("stats", stats),
         CommandHandler("members", members), CommandHandler("registered", registered), CommandHandler("unregistered", unregistered),
         CommandHandler("inactive30", inactive30), CommandHandler("inactive60", inactive60), CommandHandler("member", member),
@@ -1139,6 +1291,7 @@ def admin_handlers():
         CommandHandler("exportmembers", exportmembers), CommandHandler("exportinactive", exportinactive),
         CommandHandler("exportreferrals", exportreferrals), CommandHandler("exportall", exportall),
         CallbackQueryHandler(admin_callback, pattern=r"^admin:"),
+        CallbackQueryHandler(member_profile_callback, pattern=r"^memberprofile:(view|history):\d+$"),
         CallbackQueryHandler(guest_match_callback, pattern=r"^guestmatch:(link|skip):\d+:\d+$"),
         CallbackQueryHandler(trip_admin_callback, pattern=r"^tripadmin:"),
     ]
