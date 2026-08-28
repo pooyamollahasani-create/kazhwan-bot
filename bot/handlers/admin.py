@@ -17,6 +17,7 @@ from bot.db import Trip
 logger = logging.getLogger(__name__)
 
 MANUAL_TRIP_TITLE, MANUAL_TRIP_TYPE, MANUAL_TRIP_START, MANUAL_TRIP_END, MANUAL_GUEST_NAME, MANUAL_GUEST_PHONE, MANUAL_GUEST_STATUS, MANUAL_TRIP_DUPLICATE = range(100, 108)
+QUIET_START_INPUT, QUIET_END_INPUT = range(200, 202)
 
 
 STATUS_LABELS = {
@@ -66,6 +67,7 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("👥 اعضا", callback_data="admin:members"),
         ],
         [InlineKeyboardButton("🧳 مدیریت سفرها", callback_data="admin:trips")],
+        [InlineKeyboardButton("🔕 مدیریت ساعت سکوت", callback_data="admin:quiet")],
         [
             InlineKeyboardButton("⏳ غیرفعال ۳۰ روز", callback_data="admin:inactive30"),
             InlineKeyboardButton("⌛ غیرفعال ۶۰ روز", callback_data="admin:inactive60"),
@@ -244,7 +246,8 @@ async def chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _stats_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     db = context.application.bot_data["db"]
-    users = await db.list_group_users()
+    users = await db.list_users()
+    btc_count = await db.count_btc_users()
     unregistered = await db.list_unregistered_seen_members(limit=5000)
     inactive30 = await db.list_inactive_members(30, limit=5000)
     inactive60 = await db.list_inactive_members(60, limit=5000)
@@ -254,7 +257,8 @@ async def _stats_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     guests = await db.list_unlinked_guests(limit=5000)
     return (
         "📊 آمار مدیریتی کژوان\n\n"
-        f"اعضای ثبت‌شده در ربات: {len(users)}\n"
+        f"پروفایل‌های کژوان (KZH): {len(users)}\n"
+        f"اعضای فعال BTC: {btc_count}\n"
         f"اعضای دیده‌شده ولی ثبت‌نام‌نشده: {len(unregistered)}\n"
         f"غیرفعال بیش از ۳۰ روز: {len(inactive30)}\n"
         f"غیرفعال بیش از ۶۰ روز: {len(inactive60)}\n"
@@ -273,9 +277,9 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id, context):
         return
-    users = await context.application.bot_data["db"].list_group_users()
+    users = await context.application.bot_data["db"].list_users()
     await update.effective_message.reply_text(
-        f"👥 تعداد اعضای ثبت‌شده در ربات: {len(users)}\n\nبرای خروجی Excel از /exportmembers استفاده کنید."
+        f"👥 تعداد پروفایل‌های کژوان (KZH): {len(users)}\n\nبرای خروجی Excel از /exportmembers استفاده کنید."
     )
 
 
@@ -366,7 +370,7 @@ async def topreferrals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _member_export_rows(db, users):
     headers = [
         "نام و نام خانوادگی", "شماره تماس", "شهر", "Username", "Telegram ID",
-        "کد عضویت کژوان", "کد عضویت BTC", "کد معرف کژوان", "معرف Telegram ID",
+        "کد عضویت کژوان", "کد عضویت BTC", "عضو BTC", "کد معرف کژوان", "معرف Telegram ID",
         "تعداد معرفی موفق", "امتیاز کل", "نحوه آشنایی", "تاریخ ثبت",
         "آخرین فعالیت", "وضعیت", "تاریخچه سفرهای داخلی", "تاریخچه سفرهای خارجی",
     ]
@@ -387,7 +391,7 @@ async def _member_export_rows(db, users):
         rows.append([
             user.full_name, user.phone, user.city,
             f"@{user.telegram_username}" if user.telegram_username else "", user.telegram_id,
-            user.member_code or "", btc.btc_code if btc else "", user.referral_code or "",
+            user.member_code or "", btc.btc_code if btc else "", "بله" if btc and btc.status == "active" else "خیر", user.referral_code or "",
             user.referred_by_telegram_id or "", user.referral_count, user.points, user.discovery_source,
             user.created_at.isoformat() if user.created_at else "",
             user.last_activity_at.isoformat() if user.last_activity_at else "", user.status,
@@ -405,9 +409,9 @@ async def exportmembers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_admin(update.effective_user.id, context):
         return
     db = context.application.bot_data["db"]
-    users = await db.list_group_users()
+    users = await db.list_users()
     headers, rows = await _member_export_rows(db, users)
-    await _send_xlsx(update, headers, rows, "kazhwan_members.xlsx", "Members")
+    await _send_xlsx(update, headers, rows, "kazhwan_all_kzh_members.xlsx", "Kazhwan Members")
 
 
 async def exportinactive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -698,6 +702,116 @@ def build_admin_flow_handler() -> ConversationHandler:
     )
 
 
+def _quiet_keyboard(q):
+    status = "🟢 فعال" if q["enabled"] else "⚪ غیرفعال"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🌙 بسته‌شدن: {q['start']}", callback_data="quiet:setstart")],
+        [InlineKeyboardButton(f"☀️ بازشدن: {q['end']}", callback_data="quiet:setend")],
+        [InlineKeyboardButton(f"وضعیت: {status}", callback_data="quiet:toggle")],
+        [InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")],
+    ])
+
+
+async def quiet_settings_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id, context):
+        return ConversationHandler.END
+    await query.answer()
+    db = context.application.bot_data["db"]
+    chat_id = context.application.bot_data["settings"].group_chat_id
+    q = await db.get_quiet_settings(chat_id)
+    await query.message.reply_text(
+        f"🔕 مدیریت ساعت سکوت BTC\n\n🔒 بسته‌شدن: {q['start']}\n🔓 بازشدن: {q['end']}\nوضعیت: {'🟢 فعال' if q['enabled'] else '⚪ غیرفعال'}",
+        reply_markup=_quiet_keyboard(q),
+    )
+    return ConversationHandler.END
+
+
+async def quiet_set_start_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id, context): return ConversationHandler.END
+    await query.answer()
+    await query.message.reply_text("🌙 ساعت بسته‌شدن جدید را به شکل HH:MM بفرستید.\nمثال: 22:30")
+    return QUIET_START_INPUT
+
+
+async def quiet_set_end_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id, context): return ConversationHandler.END
+    await query.answer()
+    await query.message.reply_text("☀️ ساعت بازشدن جدید را به شکل HH:MM بفرستید.\nمثال: 10:00")
+    return QUIET_END_INPUT
+
+
+def _valid_hhmm(value: str) -> str | None:
+    try:
+        parts = value.strip().split(":")
+        if len(parts) != 2: return None
+        h, m = int(parts[0]), int(parts[1])
+        if not (0 <= h <= 23 and 0 <= m <= 59): return None
+        return f"{h:02d}:{m:02d}"
+    except ValueError:
+        return None
+
+
+async def quiet_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not is_admin(update.effective_user.id, context): return ConversationHandler.END
+    value = _valid_hhmm(update.effective_message.text)
+    if not value:
+        await update.effective_message.reply_text("❌ فرمت ساعت درست نیست. مثال صحیح: 22:30")
+        return QUIET_START_INPUT if context.user_data.get("quiet_field") == "start" else QUIET_END_INPUT
+    field = context.user_data.pop("quiet_field", "start")
+    db = context.application.bot_data["db"]
+    chat_id = context.application.bot_data["settings"].group_chat_id
+    q = await db.update_quiet_settings(chat_id, **{field: value})
+    await update.effective_message.reply_text(
+        f"✅ ساعت سکوت ذخیره شد.\n🔒 بسته‌شدن: {q['start']}\n🔓 بازشدن: {q['end']}\nوضعیت: {'🟢 فعال' if q['enabled'] else '⚪ غیرفعال'}",
+        reply_markup=_quiet_keyboard(q),
+    )
+    return ConversationHandler.END
+
+
+async def quiet_start_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["quiet_field"] = "start"
+    return await quiet_set_start_entry(update, context)
+
+async def quiet_end_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["quiet_field"] = "end"
+    return await quiet_set_end_entry(update, context)
+
+async def quiet_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id, context): return ConversationHandler.END
+    await query.answer()
+    db = context.application.bot_data["db"]
+    chat_id = context.application.bot_data["settings"].group_chat_id
+    q = await db.get_quiet_settings(chat_id)
+    q = await db.update_quiet_settings(chat_id, enabled=not q["enabled"])
+    # Watchdog applies the new state within at most one minute.
+    await query.message.reply_text(
+        f"✅ ساعت سکوت {'فعال' if q['enabled'] else 'غیرفعال'} شد.\n🔒 {q['start']} → 🔓 {q['end']}",
+        reply_markup=_quiet_keyboard(q),
+    )
+    return ConversationHandler.END
+
+
+def build_quiet_settings_handler():
+    return ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(quiet_settings_entry, pattern=r"^admin:quiet$"),
+            CallbackQueryHandler(quiet_start_prompt, pattern=r"^quiet:setstart$"),
+            CallbackQueryHandler(quiet_end_prompt, pattern=r"^quiet:setend$"),
+            CallbackQueryHandler(quiet_toggle, pattern=r"^quiet:toggle$"),
+        ],
+        states={
+            QUIET_START_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, quiet_time_input)],
+            QUIET_END_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, quiet_time_input)],
+        },
+        fallbacks=[CommandHandler("cancel", admin_flow_cancel)],
+        per_chat=True, per_user=True, allow_reentry=True,
+    )
+
+
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not is_admin(query.from_user.id, context):
@@ -709,8 +823,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "stats":
         await query.message.reply_text(await _stats_text(context))
     elif action == "members":
-        count = await context.application.bot_data["db"].count_group_users()
-        await query.message.reply_text(f"👥 اعضای ثبت‌شده: {count}\nبرای فایل کامل: /exportmembers")
+        db = context.application.bot_data["db"]
+        count = len(await db.list_users())
+        btc_count = await db.count_btc_users()
+        await query.message.reply_text(f"👥 پروفایل‌های KZH: {count}\n⛰ اعضای BTC: {btc_count}\nبرای فایل کامل: /exportmembers")
     elif action == "inactive30":
         await query.message.reply_text(await _inactive_text(context, 30))
     elif action == "inactive60":
@@ -724,7 +840,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_text(text)
     elif action == "exportall":
         db = context.application.bot_data["db"]
-        users = await db.list_group_users()
+        users = await db.list_users()
         headers, rows = await _member_export_rows(db, users)
         await query.message.reply_document(build_xlsx(headers, rows, sheet_name="Members"), filename="kazhwan_all_members.xlsx")
     elif action == "memberhelp":
@@ -1015,6 +1131,7 @@ async def guest_match_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 def admin_handlers():
     return [
         build_admin_flow_handler(),
+        build_quiet_settings_handler(),
         CommandHandler("admin", admin_panel), CommandHandler("chatid", chatid), CommandHandler("stats", stats),
         CommandHandler("members", members), CommandHandler("registered", registered), CommandHandler("unregistered", unregistered),
         CommandHandler("inactive30", inactive30), CommandHandler("inactive60", inactive60), CommandHandler("member", member),
