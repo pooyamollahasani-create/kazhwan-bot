@@ -761,7 +761,11 @@ class Database:
         value = query.strip()
         if not value:
             return []
+        digit_map = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+        value = value.translate(digit_map)
+        username_value = value[1:] if value.startswith("@") else value
         like = f"%{value}%"
+        username_like = f"%{username_value}%"
         normalized = value.upper().replace(" ", "")
         async with self.sessions() as session:
             if normalized.startswith("BTC-"):
@@ -778,7 +782,7 @@ class Database:
             conditions = [
                 User.full_name.ilike(like),
                 User.phone.ilike(like),
-                User.telegram_username.ilike(like),
+                User.telegram_username.ilike(username_like),
                 func.upper(User.member_code).ilike(f"%{normalized}%"),
                 func.upper(User.referral_code).ilike(f"%{normalized}%"),
             ]
