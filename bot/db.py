@@ -821,12 +821,10 @@ class Database:
             raise ValueError("reason is required")
 
         async with self.sessions() as session:
-            user = await session.get(User, telegram_id)
-            if not user:
-                result = await session.execute(
-                    select(User).where(User.telegram_id == telegram_id)
-                )
-                user = result.scalar_one_or_none()
+            result = await session.execute(
+                select(User).where(User.telegram_id == telegram_id)
+            )
+            user = result.scalar_one_or_none()
             if not user:
                 return None
 
