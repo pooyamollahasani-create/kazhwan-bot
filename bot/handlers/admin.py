@@ -521,7 +521,7 @@ async def manual_points_start(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
     await query.answer()
     try:
-        _, _, action, raw_id = query.data.split(":")
+        _, action, raw_id = query.data.split(":")
         telegram_id = int(raw_id)
     except (ValueError, IndexError):
         await query.message.reply_text("شناسه مسافر نامعتبر است.")
