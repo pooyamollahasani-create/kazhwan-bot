@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 MANUAL_TRIP_TITLE, MANUAL_TRIP_TYPE, MANUAL_TRIP_START, MANUAL_TRIP_END, MANUAL_GUEST_NAME, MANUAL_GUEST_PHONE, MANUAL_GUEST_STATUS, MANUAL_TRIP_DUPLICATE = range(100, 108)
 QUIET_START_INPUT, QUIET_END_INPUT = range(200, 202)
 MEMBER_SEARCH_INPUT = 300
+MANUAL_POINTS_AMOUNT, MANUAL_POINTS_REASON = range(310, 312)
 
 
 STATUS_LABELS = {
@@ -497,10 +498,137 @@ async def member_profile_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.message.reply_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ ثبت امتیاز دستی", callback_data=f"memberpoints:start:{telegram_id}")],
             [InlineKeyboardButton("🧳 تاریخچه سفرها", callback_data=f"memberprofile:history:{telegram_id}")],
             [InlineKeyboardButton("🔎 جستجوی جدید", callback_data="admin:membersearch")],
             [InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")],
         ]),
+    )
+
+
+async def manual_points_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id, context):
+        return ConversationHandler.END
+    await query.answer()
+
+    try:
+        telegram_id = int(query.data.split(":")[2])
+    except (ValueError, IndexError):
+        await query.message.reply_text("شناسه مسافر نامعتبر است.")
+        return ConversationHandler.END
+
+    db = context.application.bot_data["db"]
+    user = await db.get_user(telegram_id)
+    if not user:
+        await query.message.reply_text("این پروفایل پیدا نشد.")
+        return ConversationHandler.END
+
+    context.user_data["manual_points_target"] = telegram_id
+    context.user_data["manual_points_name"] = user.full_name
+
+    await query.message.reply_text(
+        f"⭐ ثبت امتیاز دستی برای {user.full_name}\n\n"
+        f"امتیاز فعلی: {user.points}\n\n"
+        "تعداد امتیازی که می‌خواهید اضافه شود را به‌صورت عدد صحیح وارد کنید.\n"
+        "مثال: 10"
+    )
+    return MANUAL_POINTS_AMOUNT
+
+
+async def manual_points_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_user or not is_admin(update.effective_user.id, context):
+        return ConversationHandler.END
+
+    value = (update.effective_message.text or "").strip()
+    digit_map = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    value = value.translate(digit_map)
+
+    try:
+        points = int(value)
+    except ValueError:
+        await update.effective_message.reply_text("لطفاً فقط یک عدد صحیح وارد کنید. مثال: 10")
+        return MANUAL_POINTS_AMOUNT
+
+    if points <= 0:
+        await update.effective_message.reply_text("امتیاز باید بیشتر از صفر باشد.")
+        return MANUAL_POINTS_AMOUNT
+    if points > 100000:
+        await update.effective_message.reply_text("عدد واردشده بیش از حد بزرگ است. حداکثر 100000 امتیاز.")
+        return MANUAL_POINTS_AMOUNT
+
+    context.user_data["manual_points_amount"] = points
+    name = context.user_data.get("manual_points_name", "مسافر")
+    await update.effective_message.reply_text(
+        f"📝 دلیل ثبت {points} امتیاز برای {name} را بنویسید.\n\n"
+        "مثال: همکاری در اجرای برنامه"
+    )
+    return MANUAL_POINTS_REASON
+
+
+async def manual_points_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.effective_user or not is_admin(update.effective_user.id, context):
+        return ConversationHandler.END
+
+    reason = (update.effective_message.text or "").strip()
+    if len(reason) < 2:
+        await update.effective_message.reply_text("لطفاً دلیل امتیاز را وارد کنید.")
+        return MANUAL_POINTS_REASON
+    if len(reason) > 500:
+        await update.effective_message.reply_text("دلیل خیلی طولانی است؛ حداکثر 500 کاراکتر.")
+        return MANUAL_POINTS_REASON
+
+    telegram_id = context.user_data.get("manual_points_target")
+    points = context.user_data.get("manual_points_amount")
+    if not telegram_id or not points:
+        await update.effective_message.reply_text("اطلاعات این عملیات کامل نیست. دوباره از پروفایل عضو شروع کنید.")
+        return ConversationHandler.END
+
+    db = context.application.bot_data["db"]
+    result = await db.add_manual_points(
+        telegram_id=int(telegram_id),
+        points=int(points),
+        reason=reason,
+        admin_telegram_id=update.effective_user.id,
+    )
+    if not result:
+        await update.effective_message.reply_text("پروفایل مسافر پیدا نشد و امتیاز ثبت نشد.")
+        return ConversationHandler.END
+
+    context.user_data.pop("manual_points_target", None)
+    context.user_data.pop("manual_points_name", None)
+    context.user_data.pop("manual_points_amount", None)
+
+    await update.effective_message.reply_text(
+        f"✅ امتیاز دستی ثبت شد.\n\n"
+        f"👤 {result['full_name']}\n"
+        f"➕ امتیاز افزوده‌شده: {result['points_added']}\n"
+        f"📝 دلیل: {reason}\n"
+        f"🏆 امتیاز کل جدید: {result['total_points']}\n\n"
+        "این امتیاز مستقیماً توسط مدیر ثبت شده و نیاز به تأیید مسافر ندارد.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👤 بازگشت به پروفایل", callback_data=f"memberprofile:view:{telegram_id}")],
+            [InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")],
+        ]),
+    )
+    return ConversationHandler.END
+
+
+def build_manual_points_handler() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(manual_points_start, pattern=r"^memberpoints:start:\d+$"),
+        ],
+        states={
+            MANUAL_POINTS_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, manual_points_amount)
+            ],
+            MANUAL_POINTS_REASON: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, manual_points_reason)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_flow_cancel)],
+        allow_reentry=True,
     )
 
 
@@ -1284,6 +1412,7 @@ def admin_handlers():
         build_admin_flow_handler(),
         build_quiet_settings_handler(),
         build_member_search_handler(),
+        build_manual_points_handler(),
         CommandHandler("admin", admin_panel), CommandHandler("chatid", chatid), CommandHandler("stats", stats),
         CommandHandler("members", members), CommandHandler("registered", registered), CommandHandler("unregistered", unregistered),
         CommandHandler("inactive30", inactive30), CommandHandler("inactive60", inactive60), CommandHandler("member", member),
