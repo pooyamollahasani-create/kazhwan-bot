@@ -444,6 +444,7 @@ async def member_profile_callback(update: Update, context: ContextTypes.DEFAULT_
 
     btc = await db.get_btc_membership(telegram_id)
     trips = await db.list_user_trips(telegram_id)
+    manual_history = await db.get_manual_points_history(telegram_id, limit=20)
 
     if action == "history":
         if not trips:
@@ -489,6 +490,10 @@ async def member_profile_callback(update: Update, context: ContextTypes.DEFAULT_
         f"Telegram: {username}",
         f"Telegram ID: {user.telegram_id}",
         f"⭐ امتیاز کل: {user.points}",
+        *(
+            [f"📝 امتیاز دستی اخیر: {manual_history[0].details.split(' | Admin Telegram ID:', 1)[0]}"]
+            if manual_history else []
+        ),
         f"👥 معرفی موفق: {user.referral_count}",
         "",
         f"🧳 سفرها: {len(trips)} | شرکت‌کرده {attended} | اعلام حضور {declared} | انصراف {cancelled}",
@@ -498,7 +503,11 @@ async def member_profile_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.message.reply_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ ثبت امتیاز دستی", callback_data=f"memberpoints:start:{telegram_id}")],
+            [
+                InlineKeyboardButton("➕ افزودن امتیاز", callback_data=f"memberpoints:add:{telegram_id}"),
+                InlineKeyboardButton("➖ کسر امتیاز", callback_data=f"memberpoints:subtract:{telegram_id}"),
+            ],
+            [InlineKeyboardButton("📜 تاریخچه امتیازهای دستی", callback_data=f"memberpoints:history:{telegram_id}")],
             [InlineKeyboardButton("🧳 تاریخچه سفرها", callback_data=f"memberprofile:history:{telegram_id}")],
             [InlineKeyboardButton("🔎 جستجوی جدید", callback_data="admin:membersearch")],
             [InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")],
@@ -511,9 +520,9 @@ async def manual_points_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not query or not is_admin(query.from_user.id, context):
         return ConversationHandler.END
     await query.answer()
-
     try:
-        telegram_id = int(query.data.split(":")[2])
+        _, _, action, raw_id = query.data.split(":")
+        telegram_id = int(raw_id)
     except (ValueError, IndexError):
         await query.message.reply_text("شناسه مسافر نامعتبر است.")
         return ConversationHandler.END
@@ -524,14 +533,15 @@ async def manual_points_start(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("این پروفایل پیدا نشد.")
         return ConversationHandler.END
 
+    mode = "subtract" if action == "subtract" else "add"
     context.user_data["manual_points_target"] = telegram_id
     context.user_data["manual_points_name"] = user.full_name
-
+    context.user_data["manual_points_mode"] = mode
+    label = "کسر" if mode == "subtract" else "افزودن"
     await query.message.reply_text(
-        f"⭐ ثبت امتیاز دستی برای {user.full_name}\n\n"
+        f"⭐ {label} امتیاز دستی برای {user.full_name}\n\n"
         f"امتیاز فعلی: {user.points}\n\n"
-        "تعداد امتیازی که می‌خواهید اضافه شود را به‌صورت عدد صحیح وارد کنید.\n"
-        "مثال: 10"
+        "مقدار امتیاز را به‌صورت عدد صحیح و مثبت وارد کنید.\nمثال: 10"
     )
     return MANUAL_POINTS_AMOUNT
 
@@ -557,7 +567,8 @@ async def manual_points_amount(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text("عدد واردشده بیش از حد بزرگ است. حداکثر 100000 امتیاز.")
         return MANUAL_POINTS_AMOUNT
 
-    context.user_data["manual_points_amount"] = points
+    mode = context.user_data.get("manual_points_mode", "add")
+    context.user_data["manual_points_amount"] = -points if mode == "subtract" else points
     name = context.user_data.get("manual_points_name", "مسافر")
     await update.effective_message.reply_text(
         f"📝 دلیل ثبت {points} امتیاز برای {name} را بنویسید.\n\n"
@@ -594,15 +605,22 @@ async def manual_points_reason(update: Update, context: ContextTypes.DEFAULT_TYP
     if not result:
         await update.effective_message.reply_text("پروفایل مسافر پیدا نشد و امتیاز ثبت نشد.")
         return ConversationHandler.END
+    if result.get("error") == "negative_total":
+        await update.effective_message.reply_text(
+            f"❌ این مقدار قابل کسر نیست. امتیاز فعلی {result['full_name']}: {result['current_points']}\n"
+            "امتیاز کل نمی‌تواند منفی شود."
+        )
+        return ConversationHandler.END
 
     context.user_data.pop("manual_points_target", None)
     context.user_data.pop("manual_points_name", None)
     context.user_data.pop("manual_points_amount", None)
+    context.user_data.pop("manual_points_mode", None)
 
     await update.effective_message.reply_text(
         f"✅ امتیاز دستی ثبت شد.\n\n"
         f"👤 {result['full_name']}\n"
-        f"➕ امتیاز افزوده‌شده: {result['points_added']}\n"
+        f"🔢 تغییر امتیاز: {result['points_added']:+d}\n"
         f"📝 دلیل: {reason}\n"
         f"🏆 امتیاز کل جدید: {result['total_points']}\n\n"
         "این امتیاز مستقیماً توسط مدیر ثبت شده و نیاز به تأیید مسافر ندارد.",
@@ -614,10 +632,42 @@ async def manual_points_reason(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+
+async def manual_points_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not is_admin(query.from_user.id, context):
+        return
+    await query.answer()
+    try:
+        telegram_id = int(query.data.split(":")[2])
+    except (ValueError, IndexError):
+        return
+    db = context.application.bot_data["db"]
+    user = await db.get_user(telegram_id)
+    history = await db.get_manual_points_history(telegram_id, limit=20)
+    if not user:
+        await query.message.reply_text("پروفایل پیدا نشد.")
+        return
+    if not history:
+        text = f"📜 تاریخچه امتیازهای دستی {user.full_name}\n\nهنوز موردی ثبت نشده است."
+    else:
+        rows = [f"📜 تاریخچه امتیازهای دستی {user.full_name}"]
+        for item in history:
+            clean = (item.details or "").split(" | Admin Telegram ID:", 1)[0]
+            rows.append(f"⭐ {clean}\n🗓 {_fmt_dt(item.created_at)}")
+        text = "\n\n".join(rows)
+    await query.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👤 بازگشت به پروفایل", callback_data=f"memberprofile:view:{telegram_id}")],
+            [InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")],
+        ]),
+    )
+
 def build_manual_points_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(manual_points_start, pattern=r"^memberpoints:start:\d+$"),
+            CallbackQueryHandler(manual_points_start, pattern=r"^memberpoints:(add|subtract):\d+$"),
         ],
         states={
             MANUAL_POINTS_AMOUNT: [
@@ -1413,6 +1463,7 @@ def admin_handlers():
         build_quiet_settings_handler(),
         build_member_search_handler(),
         build_manual_points_handler(),
+        CallbackQueryHandler(manual_points_history, pattern=r"^memberpoints:history:\d+$"),
         CommandHandler("admin", admin_panel), CommandHandler("chatid", chatid), CommandHandler("stats", stats),
         CommandHandler("members", members), CommandHandler("registered", registered), CommandHandler("unregistered", unregistered),
         CommandHandler("inactive30", inactive30), CommandHandler("inactive60", inactive60), CommandHandler("member", member),
