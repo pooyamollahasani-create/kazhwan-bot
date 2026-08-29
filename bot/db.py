@@ -804,6 +804,56 @@ class Database:
             )
             return list(result.scalars().all())
 
+    async def add_manual_points(
+        self,
+        telegram_id: int,
+        points: int,
+        reason: str,
+        admin_telegram_id: int,
+    ) -> dict | None:
+        """Add points directly by an admin and keep an auditable activity record."""
+        points = int(points)
+        if points <= 0:
+            raise ValueError("points must be positive")
+
+        clean_reason = (reason or "").strip()
+        if not clean_reason:
+            raise ValueError("reason is required")
+
+        async with self.sessions() as session:
+            user = await session.get(User, telegram_id)
+            if not user:
+                result = await session.execute(
+                    select(User).where(User.telegram_id == telegram_id)
+                )
+                user = result.scalar_one_or_none()
+            if not user:
+                return None
+
+            user.points = int(user.points or 0) + points
+            session.add(
+                Activity(
+                    telegram_id=user.telegram_id,
+                    activity_type="manual_points",
+                    title="امتیاز دستی مدیریت",
+                    details=(
+                        f"+{points} امتیاز | دلیل: {clean_reason} | "
+                        f"Admin Telegram ID: {admin_telegram_id}"
+                    ),
+                )
+            )
+            await session.commit()
+            await session.refresh(user)
+
+            return {
+                "telegram_id": user.telegram_id,
+                "full_name": user.full_name,
+                "points_added": points,
+                "total_points": int(user.points or 0),
+                "reason": clean_reason,
+                "admin_telegram_id": admin_telegram_id,
+            }
+
     async def list_top_referrers(self, limit: int = 20) -> list[User]:
         async with self.sessions() as session:
             result = await session.execute(
