@@ -15,6 +15,7 @@ from bot.handlers.menu import menu_handlers
 from bot.handlers.moderation import initialize_quiet_hours, moderation_handlers
 from bot.handlers.onboarding import build_onboarding_handler
 from bot.handlers.trips import trip_handlers
+from bot.handlers.feedback import feedback_handlers
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -126,6 +127,7 @@ def main() -> None:
     application.add_handlers(menu_handlers(), group=1)
     application.add_handlers(admin_handlers(), group=2)
     application.add_handlers(trip_handlers(), group=3)
+    application.add_handlers(feedback_handlers(), group=4)
     for handler in moderation_handlers():
         application.add_handler(handler, group=10)
     application.add_error_handler(error_handler)
