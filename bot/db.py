@@ -174,6 +174,9 @@ class GuestTraveler(Base):
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     normalized_phone: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     linked_telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    traveler_code: Mapped[str | None] = mapped_column(String(24), unique=True, nullable=True, index=True)
+    points: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(30), default="active", index=True)
     created_by_telegram_id: Mapped[int] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
@@ -187,7 +190,9 @@ class GuestTripParticipant(Base):
     trip_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     guest_id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     status: Mapped[str] = mapped_column(String(20), default="declared", index=True)
-    pending_points: Mapped[int] = mapped_column(Integer, default=0)
+    pending_points: Mapped[int] = mapped_column(Integer, default=0)  # legacy compatibility
+    points_awarded: Mapped[bool] = mapped_column(Boolean, default=False)
+    awarded_points: Mapped[int] = mapped_column(Integer, default=0)
     declared_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
@@ -207,6 +212,7 @@ class Database:
             await conn.run_sync(self._migrate_users_table)
             await conn.run_sync(self._migrate_trips_table)
             await conn.run_sync(self._migrate_group_moderation_table)
+            await conn.run_sync(self._migrate_guest_travelers_table)
 
         # Backfill referral codes for users that existed before this version.
         async with self.sessions() as session:
@@ -271,6 +277,28 @@ class Database:
 
             await session.commit()
 
+        # v1.8 backfill: every old unlinked guest becomes a permanent traveler.
+        async with self.sessions() as session:
+            guests_result = await session.execute(
+                select(GuestTraveler).order_by(GuestTraveler.id.asc())
+            )
+            for guest in guests_result.scalars().all():
+                if not guest.traveler_code:
+                    guest.traveler_code = f"KTR-{guest.id:06d}"
+                rows = await session.execute(
+                    select(GuestTripParticipant, Trip)
+                    .join(Trip, Trip.id == GuestTripParticipant.trip_id)
+                    .where(GuestTripParticipant.guest_id == guest.id)
+                )
+                for participant, trip in rows.all():
+                    if participant.status == "attended" and not participant.points_awarded:
+                        points = int(participant.pending_points or trip.points_value or TRIP_POINTS.get(trip.trip_type, 0))
+                        guest.points += points
+                        participant.points_awarded = True
+                        participant.awarded_points = points
+                        participant.pending_points = 0
+            await session.commit()
+
     @staticmethod
     def _migrate_users_table(sync_conn) -> None:
         """Small, idempotent migration that preserves the existing Railway data."""
@@ -321,6 +349,38 @@ class Database:
             sync_conn.exec_driver_sql(
                 "ALTER TABLE group_moderation_state ADD COLUMN quiet_end VARCHAR(5) DEFAULT '11:00' NOT NULL"
             )
+
+    @staticmethod
+    def _migrate_guest_travelers_table(sync_conn) -> None:
+        """v1.8: legacy guest rows become permanent offline traveler profiles."""
+        inspector = inspect(sync_conn)
+        tables = inspector.get_table_names()
+        if "guest_travelers" in tables:
+            existing = {c["name"] for c in inspector.get_columns("guest_travelers")}
+            additions = {
+                "traveler_code": "VARCHAR(24)",
+                "points": "INTEGER DEFAULT 0 NOT NULL",
+                "status": "VARCHAR(30) DEFAULT 'active' NOT NULL",
+            }
+            for name, sql_type in additions.items():
+                if name not in existing:
+                    sync_conn.exec_driver_sql(
+                        f"ALTER TABLE guest_travelers ADD COLUMN {name} {sql_type}"
+                    )
+            sync_conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_guest_travelers_traveler_code "
+                "ON guest_travelers (traveler_code)"
+            )
+        if "guest_trip_participants" in tables:
+            existing = {c["name"] for c in inspector.get_columns("guest_trip_participants")}
+            if "points_awarded" not in existing:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE guest_trip_participants ADD COLUMN points_awarded BOOLEAN DEFAULT FALSE NOT NULL"
+                )
+            if "awarded_points" not in existing:
+                sync_conn.exec_driver_sql(
+                    "ALTER TABLE guest_trip_participants ADD COLUMN awarded_points INTEGER DEFAULT 0 NOT NULL"
+                )
 
     @staticmethod
     def _migrate_trips_table(sync_conn) -> None:
@@ -1033,6 +1093,9 @@ class Database:
                 created_by_telegram_id=created_by_telegram_id,
             )
             session.add(guest)
+            await session.flush()
+            guest.traveler_code = f"KTR-{guest.id:06d}"
+            guest.status = "active"
             await session.commit()
             await session.refresh(guest)
             return guest
@@ -1044,21 +1107,25 @@ class Database:
     async def register_guest_trip_participant(
         self, trip_id: int, guest_id: int, status: str = "attended"
     ) -> GuestTripParticipant:
-        now = datetime.now(timezone.utc)
         async with self.sessions() as session:
             item = await session.get(GuestTripParticipant, (trip_id, guest_id))
+            guest = await session.get(GuestTraveler, guest_id)
             trip = await session.get(Trip, trip_id)
-            pending = int(trip.points_value or 0) if trip and status == "attended" else 0
-            if item:
-                item.status = status
-                item.pending_points = pending
-                item.updated_at = now
-            else:
-                item = GuestTripParticipant(
-                    trip_id=trip_id, guest_id=guest_id, status=status,
-                    pending_points=pending, updated_at=now
-                )
+            if item is None:
+                item = GuestTripParticipant(trip_id=trip_id, guest_id=guest_id, status="declared")
                 session.add(item)
+                await session.flush()
+
+            old_awarded = int(item.awarded_points or 0) if item.points_awarded else 0
+            desired = int(trip.points_value or TRIP_POINTS.get(trip.trip_type, 0)) if trip and status == "attended" else 0
+            delta = desired - old_awarded
+            if guest and delta:
+                guest.points = max(0, int(guest.points or 0) + delta)
+            item.status = status
+            item.points_awarded = desired > 0
+            item.awarded_points = desired
+            item.pending_points = 0
+            item.updated_at = datetime.now(timezone.utc)
             await session.commit()
             await session.refresh(item)
             return item
@@ -1067,16 +1134,11 @@ class Database:
         self, trip_id: int, guest_id: int, status: str
     ) -> GuestTripParticipant | None:
         async with self.sessions() as session:
-            item = await session.get(GuestTripParticipant, (trip_id, guest_id))
-            if not item:
+            exists = await session.get(GuestTripParticipant, (trip_id, guest_id))
+            if not exists:
                 return None
-            trip = await session.get(Trip, trip_id)
-            item.status = status
-            item.pending_points = int(trip.points_value or 0) if trip and status == "attended" else 0
-            item.updated_at = datetime.now(timezone.utc)
-            await session.commit()
-            await session.refresh(item)
-            return item
+        return await self.register_guest_trip_participant(trip_id, guest_id, status=status)
+
 
     async def list_guest_trip_participants(
         self, trip_id: int
@@ -1129,52 +1191,106 @@ class Database:
             user = user_result.scalar_one_or_none()
             if not guest or not user or guest.linked_telegram_id is not None:
                 return None
+
             rows = await session.execute(
                 select(GuestTripParticipant, Trip)
                 .join(Trip, Trip.id == GuestTripParticipant.trip_id)
                 .where(GuestTripParticipant.guest_id == guest_id)
                 .order_by(GuestTripParticipant.declared_at.asc())
             )
-            points_added = 0
             linked_trips = []
-            for guest_participant, trip in rows.all():
+            for gp, trip in rows.all():
                 participant = await session.get(TripParticipant, (trip.id, telegram_id))
                 if participant is None:
                     participant = TripParticipant(
-                        trip_id=trip.id, telegram_id=telegram_id, status=guest_participant.status,
-                        declared_at=guest_participant.declared_at, updated_at=datetime.now(timezone.utc),
-                        points_awarded=False, awarded_points=0,
+                        trip_id=trip.id, telegram_id=telegram_id, status=gp.status,
+                        declared_at=gp.declared_at, updated_at=datetime.now(timezone.utc),
+                        points_awarded=bool(gp.points_awarded),
+                        awarded_points=int(gp.awarded_points or 0),
                     )
                     session.add(participant)
-                    await session.flush()
-                elif participant.status != "attended" and guest_participant.status == "attended":
-                    participant.status = "attended"
-                    participant.updated_at = datetime.now(timezone.utc)
-
-                if participant.status == "attended" and not participant.points_awarded:
-                    points = int(trip.points_value or TRIP_POINTS.get(trip.trip_type, 0))
-                    user.points += points
-                    participant.points_awarded = True
-                    participant.awarded_points = points
-                    points_added += points
-                    session.add(Activity(
-                        telegram_id=telegram_id, activity_type="trip_attended",
-                        title=f"شرکت در سفر {trip.title}",
-                        details=f"{trip.trip_code} | +{points} امتیاز | اتصال سابقه دستی",
-                    ))
+                else:
+                    priority = {"cancelled": 0, "declared": 1, "attended": 2}
+                    if priority.get(gp.status, 0) > priority.get(participant.status, 0):
+                        participant.status = gp.status
+                    # Do not add trip points separately: guest.points already contains them.
+                    if gp.points_awarded and not participant.points_awarded:
+                        participant.points_awarded = True
+                        participant.awarded_points = int(gp.awarded_points or 0)
                 linked_trips.append(trip.title)
-                await session.delete(guest_participant)
 
+            transferred = int(guest.points or 0)
+            if transferred:
+                user.points += transferred
+                session.add(Activity(
+                    telegram_id=telegram_id,
+                    activity_type="offline_profile_link",
+                    title="اتصال پروفایل مسافر بدون تلگرام",
+                    details=f"{guest.traveler_code} | +{transferred} امتیاز منتقل شد",
+                ))
             guest.linked_telegram_id = telegram_id
             guest.linked_at = datetime.now(timezone.utc)
+            guest.status = "linked"
             await session.commit()
             return {
-                "guest_name": guest.full_name,
-                "user_name": user.full_name,
-                "trip_titles": linked_trips,
-                "points_added": points_added,
+                "guest_name": guest.full_name, "user_name": user.full_name,
+                "trip_titles": linked_trips, "points_added": transferred,
                 "total_points": user.points,
             }
+
+
+    async def search_offline_travelers(self, query: str, limit: int = 20) -> list[GuestTraveler]:
+        value = (query or "").strip()
+        value = value.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
+        like = f"%{value}%"
+        normalized_phone = _normalize_phone(value)
+        async with self.sessions() as session:
+            conditions = [
+                GuestTraveler.full_name.ilike(like),
+                GuestTraveler.phone.ilike(like),
+                func.upper(GuestTraveler.traveler_code).ilike(f"%{value.upper()}%"),
+            ]
+            if normalized_phone:
+                conditions.append(GuestTraveler.normalized_phone == normalized_phone)
+            result = await session.execute(
+                select(GuestTraveler)
+                .where(GuestTraveler.linked_telegram_id.is_(None), or_(*conditions))
+                .order_by(GuestTraveler.full_name.asc()).limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def add_offline_traveler_manual_points(
+        self, guest_id: int, points: int, reason: str, admin_telegram_id: int
+    ) -> dict | None:
+        points = int(points)
+        reason = (reason or "").strip()
+        async with self.sessions() as session:
+            guest = await session.get(GuestTraveler, guest_id)
+            if not guest or guest.linked_telegram_id is not None:
+                return None
+            current = int(guest.points or 0)
+            if current + points < 0:
+                return {"error": "negative_total", "full_name": guest.full_name, "current_points": current}
+            guest.points = current + points
+            # Store audit in a durable generic table without requiring Telegram ID.
+            session.add(Activity(
+                telegram_id=-int(guest.id),
+                activity_type="manual_points_offline",
+                title=f"امتیاز دستی مسافر {guest.traveler_code or guest.id}",
+                details=f"{'+' if points > 0 else ''}{points} امتیاز | دلیل: {reason} | Admin Telegram ID: {admin_telegram_id}",
+            ))
+            await session.commit()
+            return {"full_name": guest.full_name, "points_added": points, "total_points": guest.points}
+
+    async def get_offline_traveler_manual_points_history(self, guest_id: int, limit: int = 20) -> list[Activity]:
+        async with self.sessions() as session:
+            result = await session.execute(
+                select(Activity).where(
+                    Activity.telegram_id == -int(guest_id),
+                    Activity.activity_type == "manual_points_offline",
+                ).order_by(Activity.created_at.desc()).limit(limit)
+            )
+            return list(result.scalars().all())
 
     async def get_trip_by_chat_id(self, telegram_chat_id: int) -> Trip | None:
         async with self.sessions() as session:
@@ -1245,6 +1361,12 @@ class Database:
                 select(GuestTripParticipant).where(GuestTripParticipant.trip_id == trip_id)
             )
             for participant in guest_rows.scalars().all():
+                if participant.points_awarded and participant.awarded_points:
+                    guest = await session.get(GuestTraveler, participant.guest_id)
+                    if guest:
+                        guest.points = max(0, int(guest.points or 0) - int(participant.awarded_points or 0))
+                    participant.points_awarded = False
+                    participant.awarded_points = 0
                 participant.pending_points = 0
             trip.pre_archive_status = trip.status if trip.status != "archived" else (trip.pre_archive_status or "closed")
             trip.status = "archived"
@@ -1297,7 +1419,14 @@ class Database:
                 select(GuestTripParticipant).where(GuestTripParticipant.trip_id == trip_id)
             )
             for participant in guest_rows.scalars().all():
-                participant.pending_points = int(trip.points_value or 0) if participant.status == "attended" else 0
+                if participant.status == "attended" and not participant.points_awarded:
+                    guest = await session.get(GuestTraveler, participant.guest_id)
+                    points = int(trip.points_value or TRIP_POINTS.get(trip.trip_type, 0))
+                    if guest:
+                        guest.points += points
+                    participant.points_awarded = True
+                    participant.awarded_points = points
+                participant.pending_points = 0
             await session.commit()
             await session.refresh(trip)
             return trip
@@ -1362,19 +1491,30 @@ class Database:
                 merged_status = sp.status
                 if tp is not None and priority.get(tp.status, 0) >= priority.get(sp.status, 0):
                     merged_status = tp.status
+                old_awarded = int(sp.awarded_points or 0) if sp.points_awarded else 0
+                if tp is not None and tp.points_awarded:
+                    old_awarded += int(tp.awarded_points or 0)
+                desired = int(target.points_value or 0) if merged_status == "attended" else 0
                 if tp is None:
                     tp = GuestTripParticipant(
                         trip_id=target_trip_id, guest_id=sp.guest_id, status=merged_status,
-                        pending_points=int(target.points_value or 0) if merged_status == "attended" else 0,
+                        pending_points=0, points_awarded=desired > 0, awarded_points=desired,
                         declared_at=sp.declared_at, updated_at=datetime.now(timezone.utc),
                     )
                     session.add(tp)
                 else:
                     tp.status = merged_status
-                    tp.pending_points = int(target.points_value or 0) if merged_status == "attended" else 0
+                    tp.pending_points = 0
+                    tp.points_awarded = desired > 0
+                    tp.awarded_points = desired
                     tp.updated_at = datetime.now(timezone.utc)
                     if sp.declared_at and (not tp.declared_at or sp.declared_at < tp.declared_at):
                         tp.declared_at = sp.declared_at
+                guest = await session.get(GuestTraveler, sp.guest_id)
+                delta = desired - old_awarded
+                if guest and delta:
+                    guest.points = max(0, int(guest.points or 0) + delta)
+                    adjusted_points += delta
                 await session.delete(sp)
                 moved_guests += 1
 
