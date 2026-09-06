@@ -107,6 +107,7 @@ def _trip_actions_keyboard(trip) -> InlineKeyboardMarkup:
             InlineKeyboardButton("👥 مسافران", callback_data=f"tripadmin:participants:{trip.id}:0"),
             InlineKeyboardButton("📥 Excel", callback_data=f"tripadmin:export:{trip.id}"),
         ],
+        [InlineKeyboardButton("💬 نظرسنجی سفر", callback_data=f"tripfeedback:view:{trip.id}")],
     ]
     if trip.status == "open":
         rows.append([InlineKeyboardButton("🔒 بستن ثبت", callback_data=f"tripadmin:status:{trip.id}:closed")])
