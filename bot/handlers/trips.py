@@ -249,6 +249,19 @@ async def _register_trip_after_channel(query, context: ContextTypes.DEFAULT_TYPE
     if not user:
         await query.message.reply_text("ابتدا /start را بزنید و پروفایل کژوان خود را کامل کنید.")
         return
+
+    # Never let a passenger re-register the same trip. This preserves the
+    # admin-confirmed status and prevents attended trips from going back to declared.
+    existing_rows = await db.list_trip_participants(trip.id)
+    existing = next((p for p, _ in existing_rows if p.telegram_id == query.from_user.id), None)
+    if existing:
+        await query.edit_message_text(
+            f"✅ شما قبلاً سفر «{trip.title}» را در پروفایل خود ثبت کرده‌اید.\n"
+            f"وضعیت فعلی: {STATUS_LABELS.get(existing.status, existing.status)}\n\n"
+            "نیازی به ثبت دوباره نیست."
+        )
+        return
+
     if not await _is_channel_member(context, query.from_user.id):
         settings = context.application.bot_data["settings"]
         await query.edit_message_text(
@@ -324,7 +337,6 @@ async def tripattend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def tripcancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _management_in_private(update, context)
-
 
 
 def build_settrip_handler() -> ConversationHandler:
