@@ -16,6 +16,7 @@ from bot.handlers.moderation import initialize_quiet_hours, moderation_handlers
 from bot.handlers.onboarding import build_onboarding_handler
 from bot.handlers.trips import trip_handlers
 from bot.handlers.feedback import feedback_handlers
+from bot.handlers.broadcast import broadcast_handlers
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -26,8 +27,6 @@ logger = logging.getLogger(__name__)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled error", exc_info=context.error)
-    # Never spam a group with internal error messages. In private chat, a short
-    # user-facing error is still useful; full details always stay in Railway logs.
     if isinstance(update, Update) and update.effective_message and update.effective_chat:
         if update.effective_chat.type == "private":
             await update.effective_message.reply_text(
@@ -37,14 +36,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(application: Application) -> None:
     db: Database = application.bot_data["db"]
-    logger.info("Kazhwan bot v1.6 loaded; Database=%s", type(db).__module__ + "." + type(db).__name__)
+    logger.info("Kazhwan bot v1.10 loaded; Database=%s", type(db).__module__ + "." + type(db).__name__)
     settings = application.bot_data["settings"]
     await db.init()
     await initialize_quiet_hours(application)
 
-    # Command menus are intentionally scoped. Passengers in groups only see
-    # public travel commands; group admins see group-management commands;
-    # the full management menu is only shown in the admins' private chats.
     private_user_commands = [
         ("start", "شروع و تکمیل پروفایل کژوان"),
     ]
@@ -63,6 +59,7 @@ async def post_init(application: Application) -> None:
     private_admin_commands = [
         ("start", "شروع و تکمیل پروفایل کژوان"),
         ("admin", "پنل مدیریت"),
+        ("broadcast", "ارسال پیام همگانی"),
         ("stats", "آمار مدیریتی"),
         ("members", "تعداد اعضای ثبت‌شده"),
         ("member", "جستجوی عضو"),
@@ -76,9 +73,6 @@ async def post_init(application: Application) -> None:
         ("cancel", "توقف فرآیند جاری"),
     ]
 
-    # Remove old menus from all scopes used by previous releases before setting
-    # the clean passenger/admin menus. This prevents stale management commands
-    # from remaining visible to normal travelers.
     await application.bot.delete_my_commands()
     await application.bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
     await application.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats())
@@ -88,6 +82,7 @@ async def post_init(application: Application) -> None:
             await application.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=admin_id))
         except Exception:
             logger.exception("Could not clear old private admin command menu for %s", admin_id)
+
     await application.bot.set_my_commands(
         private_user_commands, scope=BotCommandScopeAllPrivateChats()
     )
@@ -98,8 +93,6 @@ async def post_init(application: Application) -> None:
         group_admin_commands, scope=BotCommandScopeAllChatAdministrators()
     )
 
-    # A private chat scope is narrower than AllPrivateChats, so only configured
-    # admins see management commands when they press '/' in the bot's PV.
     for admin_id in settings.admin_ids:
         try:
             await application.bot.set_my_commands(
@@ -128,11 +121,12 @@ def main() -> None:
     application.add_handlers(admin_handlers(), group=2)
     application.add_handlers(trip_handlers(), group=3)
     application.add_handlers(feedback_handlers(), group=4)
+    application.add_handlers(broadcast_handlers(), group=5)
     for handler in moderation_handlers():
         application.add_handler(handler, group=10)
     application.add_error_handler(error_handler)
 
-    logger.info("Kazhwan bot v1.6 is running...")
+    logger.info("Kazhwan bot v1.10 is running...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
