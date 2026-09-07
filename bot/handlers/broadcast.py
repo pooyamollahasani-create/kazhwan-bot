@@ -21,7 +21,7 @@ from bot.db import BtcMembership, Trip, TripParticipant, User
 
 logger = logging.getLogger(__name__)
 
-BROADCAST_CITY, BROADCAST_CONTENT = range(410, 412)
+BROADCAST_CITY, BROADCAST_CONTENT, BROADCAST_MANUAL_SEARCH = range(410, 413)
 
 # Importing this module patches only the admin keyboard, without replacing admin.py.
 # This keeps the tested v1.9 admin code untouched.
@@ -57,6 +57,7 @@ def _audience_keyboard() -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton("🧳 مسافران یک سفر مشخص", callback_data="broadcast:audience:trip")],
         [InlineKeyboardButton("📍 بر اساس شهر", callback_data="broadcast:audience:city")],
+        [InlineKeyboardButton("🎯 انتخاب دستی مخاطب", callback_data="broadcast:audience:manual")],
         [InlineKeyboardButton("❌ لغو", callback_data="broadcast:cancel")],
     ])
 
@@ -161,6 +162,134 @@ async def broadcast_start_callback(update: Update, context: ContextTypes.DEFAULT
     return BROADCAST_CONTENT
 
 
+
+def _manual_selection_keyboard(selected: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    for item in selected[-15:]:
+        rows.append([InlineKeyboardButton(
+            f"➖ {item['name']}"[:60],
+            callback_data=f"broadcast:manualremove:{item['telegram_id']}",
+        )])
+    rows.extend([
+        [InlineKeyboardButton("🔎 جستجوی نفر دیگر", callback_data="broadcast:manualsearch")],
+        [InlineKeyboardButton("✅ پایان انتخاب و ادامه", callback_data="broadcast:manualdone")],
+        [InlineKeyboardButton("❌ لغو", callback_data="broadcast:cancel")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _manual_search_results(db, query_text: str):
+    """Reuse the bot's mature member search and also surface offline KTR matches."""
+    users = await db.search_users(query_text, limit=15)
+    offline = await db.search_offline_travelers(query_text, limit=10)
+    return users, offline
+
+
+async def manual_search_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _is_admin(update.effective_user.id, context):
+        return ConversationHandler.END
+    text = (update.effective_message.text or "").strip()
+    if not text:
+        await update.effective_message.reply_text("نام، شماره، کد یا آیدی را بفرستید.")
+        return BROADCAST_MANUAL_SEARCH
+
+    db = context.application.bot_data["db"]
+    users, offline = await _manual_search_results(db, text)
+    rows = []
+    for user in users:
+        username = f" @{user.telegram_username}" if user.telegram_username else ""
+        rows.append([InlineKeyboardButton(
+            f"📱 {user.full_name}{username}"[:60],
+            callback_data=f"broadcast:manualadd:{user.telegram_id}",
+        )])
+    # Offline profiles are shown so the admin understands why they cannot receive Telegram messages.
+    for guest in offline[:5]:
+        rows.append([InlineKeyboardButton(
+            f"⚪ {guest.full_name} | بدون تلگرام"[:60],
+            callback_data=f"broadcast:manualoffline:{guest.id}",
+        )])
+    rows.append([InlineKeyboardButton("⬅️ مخاطبان", callback_data="broadcast:start")])
+    if not users and not offline:
+        await update.effective_message.reply_text(
+            "مخاطبی پیدا نشد. با نام، موبایل، @username، KZH، BTC، KTR یا Telegram ID دوباره جستجو کنید."
+        )
+        return BROADCAST_MANUAL_SEARCH
+    await update.effective_message.reply_text(
+        "نتیجه جستجو:\nروی مخاطب موردنظر بزنید.",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return BROADCAST_MANUAL_SEARCH
+
+
+async def manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not _is_admin(query.from_user.id, context):
+        return ConversationHandler.END
+    await query.answer()
+    parts = query.data.split(":")
+    action = parts[1]
+    data = context.user_data.setdefault("broadcast", {})
+    selected = data.setdefault("manual_selected", [])
+    db = context.application.bot_data["db"]
+
+    if action == "manualsearch":
+        await query.message.reply_text(
+            "🔎 مخاطب را جستجو کنید.\n\n"
+            "می‌توانید نام و نام خانوادگی، شماره موبایل، @username، "
+            "کد KZH/BTC/KTR یا Telegram ID را بفرستید."
+        )
+        return BROADCAST_MANUAL_SEARCH
+
+    if action == "manualoffline":
+        guest = await db.get_guest(int(parts[2]))
+        await query.answer(
+            f"{guest.full_name if guest else 'این مسافر'} تلگرام متصل ندارد و امکان ارسال پیام ندارد.",
+            show_alert=True,
+        )
+        return BROADCAST_MANUAL_SEARCH
+
+    if action == "manualadd":
+        telegram_id = int(parts[2])
+        user = await db.get_user(telegram_id)
+        if not user:
+            await query.message.reply_text("این مخاطب پیدا نشد.")
+            return BROADCAST_MANUAL_SEARCH
+        if not any(x["telegram_id"] == telegram_id for x in selected):
+            selected.append({"telegram_id": telegram_id, "name": user.full_name})
+        await query.message.reply_text(
+            f"✅ {user.full_name} اضافه شد.\n👥 انتخاب‌شده‌ها: {len(selected)}",
+            reply_markup=_manual_selection_keyboard(selected),
+        )
+        return BROADCAST_MANUAL_SEARCH
+
+    if action == "manualremove":
+        telegram_id = int(parts[2])
+        data["manual_selected"] = [x for x in selected if x["telegram_id"] != telegram_id]
+        selected = data["manual_selected"]
+        await query.message.reply_text(
+            f"🗑 حذف شد.\n👥 انتخاب‌شده‌ها: {len(selected)}",
+            reply_markup=_manual_selection_keyboard(selected),
+        )
+        return BROADCAST_MANUAL_SEARCH
+
+    if action == "manualdone":
+        if not selected:
+            await query.answer("هنوز کسی انتخاب نشده است.", show_alert=True)
+            return BROADCAST_MANUAL_SEARCH
+        data["audience"] = {"kind": "manual"}
+        data["audience_label"] = f"انتخاب دستی ({len(selected)} نفر)"
+        data["recipient_ids"] = [x["telegram_id"] for x in selected]
+        await query.message.reply_text(
+            f"🎯 مخاطب: انتخاب دستی\n👥 تعداد گیرنده: {len(selected)}\n\n"
+            "حالا پیام تبلیغاتی را بفرستید.\n\n"
+            "• متن\n• عکس + کپشن\n• ویدیو + کپشن\n\n"
+            "قبل از ارسال، پیش‌نمایش و تأیید نهایی نمایش داده می‌شود."
+        )
+        return BROADCAST_CONTENT
+
+    return BROADCAST_MANUAL_SEARCH
+
+
 async def audience_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if not query or not _is_admin(query.from_user.id, context):
@@ -168,6 +297,14 @@ async def audience_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer()
     action = query.data.split(":")[-1]
     db = context.application.bot_data["db"]
+
+    if action == "manual":
+        context.user_data["broadcast"] = {"manual_selected": []}
+        await query.message.reply_text(
+            "🎯 انتخاب دستی مخاطب\n\n"
+            "نام، شماره موبایل، @username، KZH، BTC، KTR یا Telegram ID را بفرستید."
+        )
+        return BROADCAST_MANUAL_SEARCH
 
     if action == "city":
         context.user_data["broadcast"] = {"audience": {"kind": "city"}}
@@ -384,12 +521,19 @@ def broadcast_handlers():
             CallbackQueryHandler(broadcast_start_callback, pattern=r"^broadcast:start$"),
         ],
         states={
+            BROADCAST_MANUAL_SEARCH: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, manual_search_receive),
+                CallbackQueryHandler(manual_callback, pattern=r"^broadcast:(manualadd|manualremove|manualoffline):\\d+$"),
+                CallbackQueryHandler(manual_callback, pattern=r"^broadcast:(manualsearch|manualdone)$"),
+                CallbackQueryHandler(broadcast_start_callback, pattern=r"^broadcast:start$"),
+                CallbackQueryHandler(cancel_callback, pattern=r"^broadcast:cancel$"),
+            ],
             BROADCAST_CITY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, city_receive),
                 CallbackQueryHandler(cancel_callback, pattern=r"^broadcast:cancel$"),
             ],
             BROADCAST_CONTENT: [
-                CallbackQueryHandler(audience_callback, pattern=r"^broadcast:audience:(all|btc|domestic|international|trip|city)$"),
+                CallbackQueryHandler(audience_callback, pattern=r"^broadcast:audience:(all|btc|domestic|international|trip|city|manual)$"),
                 CallbackQueryHandler(trip_callback, pattern=r"^broadcast:trip:\d+$"),
                 CallbackQueryHandler(confirm_callback, pattern=r"^broadcast:(send|change|cancel)$"),
                 CallbackQueryHandler(broadcast_start_callback, pattern=r"^broadcast:start$"),
