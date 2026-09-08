@@ -523,7 +523,7 @@ def broadcast_handlers():
         states={
             BROADCAST_MANUAL_SEARCH: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, manual_search_receive),
-                CallbackQueryHandler(manual_callback, pattern=r"^broadcast:(manualadd|manualremove|manualoffline):\\d+$"),
+                CallbackQueryHandler(manual_callback, pattern=r"^broadcast:(manualadd|manualremove|manualoffline):\d+$"),
                 CallbackQueryHandler(manual_callback, pattern=r"^broadcast:(manualsearch|manualdone)$"),
                 CallbackQueryHandler(broadcast_start_callback, pattern=r"^broadcast:start$"),
                 CallbackQueryHandler(cancel_callback, pattern=r"^broadcast:cancel$"),
