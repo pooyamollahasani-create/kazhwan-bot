@@ -1,7 +1,10 @@
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, MessageHandler, filters
 
 from bot.keyboards import main_menu
+
+DOMESTIC_TOURS_URL = "https://kazhwan.com/tours/"
+INTERNATIONAL_TOURS_URL = "https://kazhwan.com/%d8%aa%d9%88%d8%b1-%d8%ae%d8%a7%d8%b1%d8%ac%db%8c/"
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db = context.application.bot_data["db"]
@@ -31,43 +34,28 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not activities and not trips:
         await update.message.reply_text("هنوز فعالیتی برای شما ثبت نشده است.")
         return
-
     lines = ["📜 تاریخچه فعالیت‌های من", ""]
     if trips:
-        labels = {
-            "declared": "🟡 اعلام حضور",
-            "attended": "🟢 شرکت کرده",
-            "cancelled": "⚪ انصراف",
-        }
-        domestic = [(p, t) for p, t in trips if getattr(t, "trip_type", "domestic_multi") in {"domestic_day", "domestic_multi", "domestic"}]
-        international = [(p, t) for p, t in trips if getattr(t, "trip_type", "domestic_multi") == "international"]
-
+        labels = {"declared":"🟡 اعلام حضور","attended":"🟢 شرکت کرده","cancelled":"⚪ انصراف"}
+        domestic = [(p,t) for p,t in trips if getattr(t,"trip_type","domestic_multi") in {"domestic_day","domestic_multi","domestic"}]
+        international = [(p,t) for p,t in trips if getattr(t,"trip_type","domestic_multi") == "international"]
         if domestic:
             lines.append("🇮🇷 سفرهای داخلی")
             for participant, trip in domestic:
-                subtype = "یک‌روزه" if getattr(trip, "trip_type", "domestic_multi") == "domestic_day" else "چندروزه"
-                points = participant.awarded_points if getattr(participant, "points_awarded", False) else 0
-                lines.append(
-                    f"• {trip.title} ({subtype}) — {trip.start_date_text} تا {trip.end_date_text} — "
-                    f"{labels.get(participant.status, participant.status)} — {points} امتیاز"
-                )
+                subtype = "یک‌روزه" if getattr(trip,"trip_type","domestic_multi") == "domestic_day" else "چندروزه"
+                points = participant.awarded_points if getattr(participant,"points_awarded",False) else 0
+                lines.append(f"• {trip.title} ({subtype}) — {trip.start_date_text} تا {trip.end_date_text} — {labels.get(participant.status, participant.status)} — {points} امتیاز")
             lines.append("")
-
         if international:
             lines.append("🌍 سفرهای خارجی")
             for participant, trip in international:
-                points = participant.awarded_points if getattr(participant, "points_awarded", False) else 0
-                lines.append(
-                    f"• {trip.title} — {trip.start_date_text} تا {trip.end_date_text} — "
-                    f"{labels.get(participant.status, participant.status)} — {points} امتیاز"
-                )
+                points = participant.awarded_points if getattr(participant,"points_awarded",False) else 0
+                lines.append(f"• {trip.title} — {trip.start_date_text} تا {trip.end_date_text} — {labels.get(participant.status, participant.status)} — {points} امتیاز")
             lines.append("")
-
     if activities:
         lines.append("🌿 سایر فعالیت‌ها")
         for item in activities:
-            date_text = item.created_at.strftime("%Y/%m/%d")
-            lines.append(f"• {date_text} — {item.title}")
+            lines.append(f"• {item.created_at.strftime('%Y/%m/%d')} — {item.title}")
     await update.message.reply_text("\n".join(lines))
 
 async def card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -90,14 +78,19 @@ async def card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = context.application.bot_data["settings"]
+    await update.message.reply_text(f"📞 راه ارتباط با پشتیبانی:\n{settings.support_contact}")
+
+async def future_programs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        f"📞 راه ارتباط با پشتیبانی:\n{settings.support_contact}"
+        "🗓 برنامه‌های آینده کژوان\n\nنوع سفر موردنظرتان را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🇮🇷 سفرهای داخلی", url=DOMESTIC_TOURS_URL)],
+            [InlineKeyboardButton("🌍 سفرهای خارجی", url=INTERNATIONAL_TOURS_URL)],
+        ]),
     )
 
 async def placeholder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "این بخش در نسخه بعدی فعال می‌شود. زیرساخت آن از همین حالا در حال آماده‌سازی است."
-    )
+    await update.message.reply_text("این بخش در نسخه بعدی فعال می‌شود. زیرساخت آن از همین حالا در حال آماده‌سازی است.")
 
 def menu_handlers():
     return [
@@ -105,8 +98,6 @@ def menu_handlers():
         MessageHandler(filters.Regex("^📜 تاریخچه فعالیت‌های من$"), history),
         MessageHandler(filters.Regex("^🎖 کارت عضویت$"), card),
         MessageHandler(filters.Regex("^📞 پشتیبانی$"), support),
-        MessageHandler(
-            filters.Regex("^(🗓 برنامه‌های آینده|📝 ثبت‌نام‌های من)$"),
-            placeholder,
-        ),
+        MessageHandler(filters.Regex("^🗓 برنامه‌های آینده$"), future_programs),
+        MessageHandler(filters.Regex("^📝 ثبت‌نام‌های من$"), placeholder),
     ]
