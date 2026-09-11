@@ -40,7 +40,7 @@ def discovery_keyboard() -> InlineKeyboardMarkup:
 def referral_question_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ بله، کد معرف دارم", callback_data="referral:yes"),
+            InlineKeyboardButton("✅ بله، معرف دارم", callback_data="referral:yes"),
             InlineKeyboardButton("❌ خیر", callback_data="referral:no"),
         ]
     ])
@@ -48,7 +48,7 @@ def referral_question_keyboard() -> InlineKeyboardMarkup:
 
 def referral_retry_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ کد معرف ندارم", callback_data="referral:no")]
+        [InlineKeyboardButton("❌ معرف ندارم", callback_data="referral:no")]
     ])
 
 
