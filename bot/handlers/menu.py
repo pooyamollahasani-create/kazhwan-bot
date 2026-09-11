@@ -10,6 +10,12 @@ INTERNATIONAL_TOURS_URL = "https://kazhwan.com/%d8%aa%d9%88%d8%b1-%d8%ae%d8%a7%d
 EDIT_VALUE, EDIT_PHONE, EDIT_SOURCE, EDIT_SOURCE_OTHER = range(4)
 
 
+def _profile_actions_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ ویرایش پروفایل", callback_data="profileedit:open")]
+    ])
+
+
 def _edit_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 نام و نام خانوادگی", callback_data="profileedit:full_name")],
@@ -17,7 +23,7 @@ def _edit_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🏙 شهر", callback_data="profileedit:city"),
          InlineKeyboardButton("📍 محله", callback_data="profileedit:neighborhood")],
         [InlineKeyboardButton("📣 نحوه آشنایی با کژوان", callback_data="profileedit:discovery_source")],
-        [InlineKeyboardButton("❌ بستن", callback_data="profileedit:close")],
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="profileedit:back")],
     ])
 
 
@@ -43,7 +49,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"تعداد معرفی موفق: {user.referral_count}\n"
         f"امتیاز: {user.points}\n"
         f"وضعیت: {user.status}",
-        reply_markup=_edit_keyboard(),
+        reply_markup=_profile_actions_keyboard(),
     )
 
 
@@ -51,8 +57,13 @@ async def edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     field = query.data.split(":", 1)[1]
-    if field == "close":
-        await query.edit_message_reply_markup(reply_markup=None)
+
+    if field == "open":
+        await query.edit_message_reply_markup(reply_markup=_edit_keyboard())
+        return ConversationHandler.END
+
+    if field == "back":
+        await query.edit_message_reply_markup(reply_markup=_profile_actions_keyboard())
         return ConversationHandler.END
 
     context.user_data["profile_edit_field"] = field
