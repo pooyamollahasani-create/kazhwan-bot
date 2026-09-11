@@ -23,15 +23,54 @@ from bot.keyboards import (
     rules_keyboard,
     trip_confirm_keyboard,
 )
+from bot.profile_extra import save_neighborhood
 from bot.texts import RULES_TEXT, WELCOME_TEXT
 
 logger = logging.getLogger(__name__)
 
-FULL_NAME, PHONE, CITY, SOURCE, SOURCE_OTHER, REFERRAL_HAS, REFERRAL_CODE, CHANNEL, RULES = range(9)
+(
+    FULL_NAME,
+    PHONE,
+    CITY,
+    NEIGHBORHOOD,
+    SOURCE,
+    SOURCE_OTHER,
+    REFERRAL_HAS,
+    REFERRAL_SEARCH,
+    REFERRAL_CONFIRM,
+    CHANNEL,
+    RULES,
+) = range(11)
 
 
 def _is_private(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.type == ChatType.PRIVATE)
+
+
+def _mask_phone(value: str | None) -> str:
+    if not value:
+        return "ثبت نشده"
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if len(digits) <= 7:
+        return value
+    return f"{digits[:4]}***{digits[-4:]}"
+
+
+async def _show_referrer_confirmation(message, context, referrer) -> int:
+    context.user_data["pending_referrer_telegram_id"] = referrer.telegram_id
+    await message.reply_text(
+        "آیا معرف شما این شخص است؟\n\n"
+        f"👤 {referrer.full_name}\n"
+        f"📍 {referrer.city or '-'}\n"
+        f"📱 {_mask_phone(referrer.phone)}",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ بله، همین شخص است", callback_data="referralconfirm:yes"),
+                InlineKeyboardButton("🔎 خیر، دوباره جستجو", callback_data="referralconfirm:no"),
+            ]
+        ]),
+    )
+    return REFERRAL_CONFIRM
 
 
 async def begin_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -49,7 +88,6 @@ async def begin_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE)
     db = context.application.bot_data["db"]
     existing = await db.get_user(request.from_user.id)
 
-    # Persist the pending request so a Railway restart does not lose it mid-form.
     await db.save_pending_join(
         telegram_id=request.from_user.id,
         group_chat_id=request.chat.id,
@@ -57,8 +95,6 @@ async def begin_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     context.user_data.clear()
 
-    # Existing Kazhwan profile: BTC is a separate membership. If BTC rules were
-    # already accepted, approve immediately; otherwise ask only for BTC rules.
     if existing and existing.channel_verified:
         btc = await db.get_btc_membership(request.from_user.id)
         if btc and btc.rules_accepted:
@@ -219,6 +255,20 @@ async def city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return CITY
     context.user_data["city"] = value
     await update.message.reply_text(
+        "محله محل سکونت خود را وارد کنید:\n"
+        "مثال: ستارخان، عظیمیه، مهرشهر\n\n"
+        "اگر محله مشخصی ندارید بنویسید «ندارم»."
+    )
+    return NEIGHBORHOOD
+
+
+async def neighborhood(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = (update.message.text or "").strip()
+    if len(value) < 2:
+        await update.message.reply_text("لطفاً نام محله را وارد کنید یا بنویسید «ندارم».")
+        return NEIGHBORHOOD
+    context.user_data["neighborhood"] = value
+    await update.message.reply_text(
         "از کجا با کژوان آشنا شدید؟",
         reply_markup=discovery_keyboard(),
     )
@@ -235,7 +285,7 @@ async def source(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data["discovery_source"] = selected
     await query.message.reply_text(
-        "آیا کد معرف دارید؟",
+        "آیا معرف دارید؟",
         reply_markup=referral_question_keyboard(),
     )
     return REFERRAL_HAS
@@ -248,7 +298,7 @@ async def source_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return SOURCE_OTHER
     context.user_data["discovery_source"] = selected
     await update.message.reply_text(
-        "آیا کد معرف دارید؟",
+        "آیا معرف دارید؟",
         reply_markup=referral_question_keyboard(),
     )
     return REFERRAL_HAS
@@ -264,34 +314,110 @@ async def referral_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return await ask_channel_membership(query.message, context)
 
     await query.message.reply_text(
-        "لطفاً کد معرف را وارد کنید.\nمثال: KZH-R000123",
+        "برای پیدا کردن معرف، یکی از این موارد را وارد کنید:\n\n"
+        "• نام و نام خانوادگی\n"
+        "• شماره موبایل\n"
+        "• کد معرف یا کد عضویت KZH\n\n"
+        "مثال: محمد رضایی یا 09121234567",
         reply_markup=referral_retry_keyboard(),
     )
-    return REFERRAL_CODE
+    return REFERRAL_SEARCH
 
 
-async def referral_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    code = (update.message.text or "").strip().upper().replace(" ", "")
+async def referral_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    value = (update.message.text or "").strip()
+    if len(value) < 2:
+        await update.message.reply_text(
+            "نام، شماره موبایل یا کد معرف را کمی کامل‌تر وارد کنید.",
+            reply_markup=referral_retry_keyboard(),
+        )
+        return REFERRAL_SEARCH
+
     db = context.application.bot_data["db"]
-    referrer = await db.get_user_by_referral_code(code)
+    candidates = await db.search_users(value, limit=12)
+    candidates = [
+        user for user in candidates
+        if user.telegram_id != update.effective_user.id and user.status == "active"
+    ]
 
+    if not candidates:
+        await update.message.reply_text(
+            "معرفی با این مشخصات پیدا نشد.\n"
+            "دوباره نام، شماره موبایل یا کد را وارد کنید؛ "
+            "یا اگر معرف ندارید دکمه «معرف ندارم» را بزنید.",
+            reply_markup=referral_retry_keyboard(),
+        )
+        return REFERRAL_SEARCH
+
+    if len(candidates) == 1:
+        return await _show_referrer_confirmation(update.message, context, candidates[0])
+
+    rows = []
+    for user in candidates[:8]:
+        label = f"👤 {user.full_name} | {user.city or '-'} | {_mask_phone(user.phone)}"
+        rows.append([
+            InlineKeyboardButton(
+                label[:60],
+                callback_data=f"referralpick:{user.telegram_id}",
+            )
+        ])
+    rows.append([InlineKeyboardButton("❌ معرف ندارم", callback_data="referral:no")])
+    await update.message.reply_text(
+        "چند نفر پیدا شدند. معرف خودتان را انتخاب کنید:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return REFERRAL_SEARCH
+
+
+async def referral_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    try:
+        telegram_id = int(query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.message.reply_text("این انتخاب معتبر نیست. دوباره جستجو کنید.")
+        return REFERRAL_SEARCH
+
+    if telegram_id == query.from_user.id:
+        await query.message.reply_text("نمی‌توانید خودتان را به عنوان معرف انتخاب کنید.")
+        return REFERRAL_SEARCH
+
+    db = context.application.bot_data["db"]
+    referrer = await db.get_user(telegram_id)
     if not referrer:
-        await update.message.reply_text(
-            "این کد معرف معتبر نیست. دوباره وارد کنید یا «کد معرف ندارم» را بزنید.",
-            reply_markup=referral_retry_keyboard(),
-        )
-        return REFERRAL_CODE
+        await query.message.reply_text("این شخص پیدا نشد. لطفاً دوباره جستجو کنید.")
+        return REFERRAL_SEARCH
 
-    if referrer.telegram_id == update.effective_user.id:
-        await update.message.reply_text(
-            "نمی‌توانید کد معرف خودتان را وارد کنید. کد دیگری وارد کنید یا «کد معرف ندارم» را بزنید.",
+    return await _show_referrer_confirmation(query.message, context, referrer)
+
+
+async def referral_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "no":
+        context.user_data.pop("pending_referrer_telegram_id", None)
+        await query.message.reply_text(
+            "دوباره نام، شماره موبایل یا کد معرف را وارد کنید:",
             reply_markup=referral_retry_keyboard(),
         )
-        return REFERRAL_CODE
+        return REFERRAL_SEARCH
+
+    telegram_id = context.user_data.pop("pending_referrer_telegram_id", None)
+    if telegram_id is None:
+        await query.message.reply_text("لطفاً معرف را دوباره جستجو کنید.")
+        return REFERRAL_SEARCH
+
+    db = context.application.bot_data["db"]
+    referrer = await db.get_user(int(telegram_id))
+    if not referrer or referrer.telegram_id == query.from_user.id:
+        await query.message.reply_text("معرف معتبر نیست. لطفاً دوباره جستجو کنید.")
+        return REFERRAL_SEARCH
 
     context.user_data["referred_by_telegram_id"] = referrer.telegram_id
-    await update.message.reply_text(f"✅ کد معرف {code} تأیید شد.")
-    return await ask_channel_membership(update.message, context)
+    await query.message.reply_text(f"✅ معرف شما «{referrer.full_name}» ثبت شد.")
+    return await ask_channel_membership(query.message, context)
 
 
 async def ask_channel_membership(message, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -333,7 +459,6 @@ async def check_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if pending_join:
         await query.message.reply_text(RULES_TEXT, reply_markup=rules_keyboard())
         return RULES
-    # Kazhwan profile / trip registration does not require BTC group rules.
     return await finish_registration(update, context)
 
 
@@ -387,12 +512,14 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
             discovery_source=context.user_data["discovery_source"],
             referred_by_telegram_id=context.user_data.get("referred_by_telegram_id"),
         )
+        await save_neighborhood(
+            db,
+            tg_user.id,
+            context.user_data.get("neighborhood", ""),
+        )
 
-    # Referral is Kazhwan-wide, not tied to BTC membership.
     await db.reward_referrer_if_needed(tg_user.id)
 
-    # If this newly-created profile resembles a manually-entered traveler,
-    # ask admins to confirm the merge. Never auto-merge by name alone.
     if is_new_profile:
         await _notify_admins_about_guest_matches(context, user)
 
@@ -429,7 +556,6 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"کد معرف کژوان: {user.referral_code}"
         )
     else:
-        # Existing group members can register directly in PV without a Join Request.
         settings = context.application.bot_data["settings"]
         already_in_group = False
         if settings.group_chat_id:
@@ -481,7 +607,6 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Keep the join request pending; the user can restart later.
     context.user_data.clear()
     await update.message.reply_text(
         "فرآیند تکمیل اطلاعات متوقف شد. برای شروع دوباره /start را بزنید."
@@ -499,12 +624,18 @@ def build_onboarding_handler() -> ConversationHandler:
             FULL_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, full_name)],
             PHONE: [MessageHandler(filters.CONTACT, phone)],
             CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, city)],
+            NEIGHBORHOOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, neighborhood)],
             SOURCE: [CallbackQueryHandler(source, pattern="^source:")],
             SOURCE_OTHER: [MessageHandler(filters.TEXT & ~filters.COMMAND, source_other)],
             REFERRAL_HAS: [CallbackQueryHandler(referral_choice, pattern="^referral:(yes|no)$")],
-            REFERRAL_CODE: [
+            REFERRAL_SEARCH: [
                 CallbackQueryHandler(referral_choice, pattern="^referral:no$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, referral_code),
+                CallbackQueryHandler(referral_pick, pattern=r"^referralpick:-?\d+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, referral_search),
+            ],
+            REFERRAL_CONFIRM: [
+                CallbackQueryHandler(referral_confirm, pattern="^referralconfirm:(yes|no)$"),
+                CallbackQueryHandler(referral_choice, pattern="^referral:no$"),
             ],
             CHANNEL: [CallbackQueryHandler(check_channel, pattern="^check_channel$")],
             RULES: [CallbackQueryHandler(accept_rules, pattern="^accept_rules$")],
