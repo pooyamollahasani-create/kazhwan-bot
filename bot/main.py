@@ -12,6 +12,8 @@ from bot.handlers.feedback import feedback_handlers
 from bot.handlers.broadcast import broadcast_handlers
 from bot.prebooking_admin_patch import install as install_prebooking_admin
 install_prebooking_admin()
+from bot.trip_calendar_patch import install as install_trip_calendar
+install_trip_calendar()
 from bot.handlers.prebooking import handlers as prebooking_handlers,initialize_prebooking
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",level=logging.INFO)
 logger=logging.getLogger(__name__)
