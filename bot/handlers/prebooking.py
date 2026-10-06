@@ -1,11 +1,11 @@
-import asyncio, logging
+import asyncio, logging, html, io, re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, func, select
 from sqlalchemy.orm import Mapped, mapped_column
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
-from bot.db import Base, Activity, Trip, User
+from bot.db import Base, Activity, Trip, User, BtcMembership
 
 log=logging.getLogger(__name__)
 IR=ZoneInfo("Asia/Tehran")
@@ -56,10 +56,32 @@ class Prebooking(Base):
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
     updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
 
+class PrebookingReceipt(Base):
+    __tablename__="prebooking_receipts"
+    id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
+    trip_id:Mapped[int]=mapped_column(Integer,index=True)
+    telegram_id:Mapped[int]=mapped_column(BigInteger,index=True)
+    file_id:Mapped[str]=mapped_column(String(255))
+    status:Mapped[str]=mapped_column(String(20),default="pending",index=True)
+    submitted_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
+    reviewed_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
+    reviewed_by:Mapped[int|None]=mapped_column(BigInteger,nullable=True)
+
 def admin(uid,c): return uid in c.application.bot_data["settings"].admin_ids
 def money(n): return f"{int(n or 0):,} تومان"
 def aware(d): return d.replace(tzinfo=timezone.utc) if d and d.tzinfo is None else d
-def fdt(d): return aware(d).astimezone(IR).strftime("%Y/%m/%d - %H:%M") if d else "تعیین نشده"
+def fdt(d):
+    if not d:return "تعیین نشده"
+    z=aware(d).astimezone(IR)
+    jy,jm,jd=gregorian_to_jalali(z.year,z.month,z.day)
+    return f"{jd} {JMONTHS[jm-1]} {jy} - {z:%H:%M}"
+
+def jalali_trip_date(value):
+    v=(value or "").strip()
+    m=re.search(r"(20\\d{2})[-/](\\d{1,2})[-/](\\d{1,2})",v)
+    if not m:return v
+    gy,gm,gd=map(int,m.groups());jy,jm,jd=gregorian_to_jalali(gy,gm,gd)
+    return f"{jd} {JMONTHS[jm-1]} {jy}"
 def remain(d):
     if not d:return "تعیین نشده"
     sec=int((aware(d)-datetime.now(timezone.utc)).total_seconds())
@@ -85,7 +107,7 @@ async def counts(db,tid):
 
 async def text(db,t,c):
     a,w=await counts(db,t.id); left=max(0,c.capacity-a)
-    lines=[f"🧳 {t.title}",f"📅 تاریخ سفر: {t.start_date_text} تا {t.end_date_text}","",
+    lines=[f"🧳 {t.title}",f"📅 تاریخ سفر: {jalali_trip_date(t.start_date_text)} تا {jalali_trip_date(t.end_date_text)}","",
            f"💰 قیمت اصلی: {money(c.regular_price)}"]
     if c.early_discount:
         lines += [f"🎁 تخفیف ثبت‌نام زودهنگام: {money(c.early_discount)}",
@@ -149,9 +171,26 @@ async def passenger(update:Update,c:ContextTypes.DEFAULT_TYPE):
             await s.commit();await q.answer("پیش‌رزرو ثبت شد." if st=="prebooked" else "وارد لیست انتظار شدید.",show_alert=True)
             if st=="prebooked":
                 pay=max(0,int(x.regular_price or 0)-int(x.early_discount or 0));owner=f" به نام {x.payment_recipient}" if x.payment_recipient else ""
-                await c.bot.send_message(q.from_user.id,f"✅ پیش‌رزرو شما برای «{t.title}» ثبت شد.\n\nبرای قطعی شدن رزرو و استفاده از تخفیف {money(x.early_discount)}، مبلغ {money(pay)} را به {x.payment_account or 'شماره پرداخت اعلام‌شده توسط کژوان'}{owner} پرداخت کنید و عکس رسید را همین‌جا بفرستید.")
+                account=html.escape(x.payment_account or "شماره پرداخت هنوز ثبت نشده")
+                recipient=html.escape(x.payment_recipient or "")
+                await c.bot.send_message(q.from_user.id,
+                    f"✅ پیش‌رزرو شما برای «{html.escape(t.title)}» ثبت شد.\n\n"
+                    f"💰 مبلغ قابل پرداخت: {money(pay)}\n"
+                    f"🎁 تخفیف شما: {money(x.early_discount)}\n\n"
+                    f"💳 شماره کارت/حساب/شبا:\n<code>{account}</code>"
+                    + (f"\n👤 به نام: {recipient}" if recipient else "")
+                    + "\n\nبعد از واریز، عکس رسید را همین‌جا بفرستید.",
+                    parse_mode="HTML")
         else:
             if not r or r.status not in ("prebooked","confirmed","waitlist"):await q.answer("رزرو فعالی ندارید.",show_alert=True);return
+            await q.answer()
+            await q.message.reply_text(
+                f"⚠️ با ادامه لغو، نام شما از فهرست پیش‌رزرو «{t.title}» خارج می‌شود.\nآیا از لغو مطمئن هستید؟",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ بله، لغو شود",callback_data=f"preconfirm:yes:{tid}"),
+                    InlineKeyboardButton("↩️ خیر",callback_data=f"preconfirm:no:{tid}")
+                ]]))
+            return
             active=r.status in ("prebooked","confirmed"); penalty=0
             penalty_start=aware(x.cancel_from_at) if x.cancel_from_at else (aware(x.execution_at)-timedelta(hours=x.cancel_hours) if x.execution_at and x.cancel_hours else None)
             if active and penalty_start and x.cancel_points and now>=penalty_start:
@@ -163,6 +202,116 @@ async def passenger(update:Update,c:ContextTypes.DEFAULT_TYPE):
                 if nxt:nxt.status="prebooked";nxt.updated_at=now
             await s.commit();await q.answer("لغو شد"+(f"؛ {penalty} امتیاز جریمه شد." if penalty else "."),show_alert=True)
     await refresh(c,tid)
+
+
+
+async def cancel_confirm(update,c):
+    q=update.callback_query;z=q.data.split(":");choice=z[1];tid=int(z[2])
+    if choice=="no":
+        await q.answer("لغو انجام نشد.");await q.edit_message_text("↩️ پیش‌رزرو شما بدون تغییر باقی ماند.");return
+    db=c.application.bot_data["db"];x=await cfg(db,tid);t=await trip(db,tid);now=datetime.now(timezone.utc)
+    async with db.sessions() as ss:
+        u=(await ss.execute(select(User).where(User.telegram_id==q.from_user.id))).scalar_one_or_none()
+        r=(await ss.execute(select(Prebooking).where(Prebooking.trip_id==tid,Prebooking.telegram_id==q.from_user.id))).scalar_one_or_none()
+        if not u or not r or r.status not in ("prebooked","confirmed","waitlist"):
+            await q.answer("رزرو فعالی ندارید.",show_alert=True);return
+        active=r.status in ("prebooked","confirmed");penalty=0
+        penalty_start=aware(x.cancel_from_at) if x and x.cancel_from_at else (aware(x.execution_at)-timedelta(hours=x.cancel_hours) if x and x.execution_at and x.cancel_hours else None)
+        if active and penalty_start and x.cancel_points and now>=penalty_start:
+            penalty=min(int(u.points or 0),int(x.cancel_points or 0));u.points=int(u.points or 0)-penalty;r.penalty_points=penalty
+            if penalty:ss.add(Activity(telegram_id=u.telegram_id,activity_type="prebooking_cancel_penalty",title=f"جریمه لغو دیرهنگام {t.title}",details=f"-{penalty} امتیاز"))
+        r.status="cancelled";r.updated_at=now
+        if active and x.waitlist:
+            nxt=(await ss.execute(select(Prebooking).where(Prebooking.trip_id==tid,Prebooking.status=="waitlist").order_by(Prebooking.created_at).limit(1))).scalar_one_or_none()
+            if nxt:nxt.status="prebooked";nxt.updated_at=now
+        await ss.commit()
+    await q.answer("لغو شد.",show_alert=True)
+    await q.edit_message_text("✅ پیش‌رزرو شما لغو شد."+ (f"\n➖ {penalty} امتیاز جریمه اعمال شد." if penalty else ""))
+    await refresh(c,tid)
+
+async def receipt_photo(update,c):
+    if not update.effective_chat or update.effective_chat.type!="private" or not update.message or not update.message.photo:return
+    uid=update.effective_user.id;db=c.application.bot_data["db"]
+    async with db.sessions() as ss:
+        rows=(await ss.execute(select(Prebooking,Trip).join(Trip,Trip.id==Prebooking.trip_id).where(
+            Prebooking.telegram_id==uid,Prebooking.status=="prebooked").order_by(Prebooking.created_at.desc()))).all()
+    if not rows:return
+    if len(rows)>1 and not c.user_data.get("receipt_trip_id"):
+        c.user_data["pending_receipt_file_id"]=update.message.photo[-1].file_id
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton(t.title[:55],callback_data=f"receipttrip:{t.id}")] for _,t in rows])
+        await update.message.reply_text("این رسید مربوط به کدام سفر است؟",reply_markup=kb);return
+    tid=int(c.user_data.pop("receipt_trip_id",0) or rows[0][1].id)
+    await save_and_forward_receipt(update,c,tid,update.message.photo[-1].file_id)
+
+async def receipt_trip_pick(update,c):
+    q=update.callback_query;tid=int(q.data.split(":")[1]);file_id=c.user_data.pop("pending_receipt_file_id",None)
+    if not file_id:await q.answer("رسید پیدا نشد؛ دوباره عکس را بفرست.",show_alert=True);return
+    await q.answer();await save_and_forward_receipt(update,c,tid,file_id)
+
+async def save_and_forward_receipt(update,c,tid,file_id):
+    uid=update.effective_user.id;db=c.application.bot_data["db"];t=await trip(db,tid)
+    async with db.sessions() as ss:
+        pb=(await ss.execute(select(Prebooking).where(Prebooking.trip_id==tid,Prebooking.telegram_id==uid,Prebooking.status=="prebooked"))).scalar_one_or_none()
+        u=(await ss.execute(select(User).where(User.telegram_id==uid))).scalar_one_or_none()
+        if not pb or not u:
+            await update.effective_message.reply_text("برای این سفر پیش‌رزرو در انتظار پرداخت پیدا نشد.");return
+        rec=PrebookingReceipt(trip_id=tid,telegram_id=uid,file_id=file_id,status="pending");ss.add(rec);await ss.commit();await ss.refresh(rec)
+        amount=pb.price_snapshot
+    await update.effective_message.reply_text("✅ رسید دریافت شد و برای بررسی ادمین ارسال شد.")
+    caption=f"🧾 رسید پرداخت جدید\n\n👤 {u.full_name}\n📱 {u.phone}\n🧳 {t.title}\n💰 مبلغ مورد انتظار: {money(amount)}"
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید پرداخت",callback_data=f"receipt:approve:{rec.id}"),
+                              InlineKeyboardButton("❌ رد رسید",callback_data=f"receipt:reject:{rec.id}")]])
+    for aid in c.application.bot_data["settings"].admin_ids:
+        try:await c.bot.send_photo(chat_id=aid,photo=file_id,caption=caption,reply_markup=kb)
+        except Exception:log.exception("send receipt to admin=%s",aid)
+
+async def receipt_review(update,c):
+    q=update.callback_query
+    if not admin(q.from_user.id,c):return
+    _,act,rid=q.data.split(":");rid=int(rid);db=c.application.bot_data["db"];now=datetime.now(timezone.utc)
+    async with db.sessions() as ss:
+        rec=(await ss.execute(select(PrebookingReceipt).where(PrebookingReceipt.id==rid))).scalar_one_or_none()
+        if not rec:await q.answer("رسید پیدا نشد.",show_alert=True);return
+        if rec.status!="pending":await q.answer("این رسید قبلاً بررسی شده.",show_alert=True);return
+        pb=(await ss.execute(select(Prebooking).where(Prebooking.trip_id==rec.trip_id,Prebooking.telegram_id==rec.telegram_id))).scalar_one_or_none()
+        t=(await ss.execute(select(Trip).where(Trip.id==rec.trip_id))).scalar_one_or_none()
+        u=(await ss.execute(select(User).where(User.telegram_id==rec.telegram_id))).scalar_one_or_none()
+        rec.status="approved" if act=="approve" else "rejected";rec.reviewed_at=now;rec.reviewed_by=q.from_user.id
+        if act=="approve" and pb and pb.status=="prebooked":pb.status="confirmed";pb.updated_at=now
+        await ss.commit()
+    if act=="approve":
+        await q.answer("پرداخت تأیید شد.");await q.edit_message_caption(caption=(q.message.caption or "")+"\n\n✅ پرداخت تأیید شد.")
+        try:await c.bot.send_message(rec.telegram_id,f"✅ پرداخت شما برای «{t.title}» تأیید شد.\nوضعیت رزرو: 🟢 رزرو قطعی")
+        except Exception:log.exception("notify approved receipt")
+        await refresh(c,rec.trip_id)
+    else:
+        await q.answer("رسید رد شد.");await q.edit_message_caption(caption=(q.message.caption or "")+"\n\n❌ رسید تأیید نشد.")
+        try:await c.bot.send_message(rec.telegram_id,f"❌ رسید پرداخت شما برای «{t.title}» تأیید نشد.\nدر صورت نیاز، تصویر رسید صحیح را دوباره همین‌جا ارسال کنید.")
+        except Exception:log.exception("notify rejected receipt")
+
+async def export_confirmed(update,c):
+    q=update.callback_query
+    if not admin(q.from_user.id,c):return
+    await q.answer();tid=int(q.data.split(":")[2]);db=c.application.bot_data["db"];t=await trip(db,tid)
+    async with db.sessions() as ss:
+        rows=(await ss.execute(select(Prebooking,User).join(User,User.telegram_id==Prebooking.telegram_id).where(
+            Prebooking.trip_id==tid,Prebooking.status=="confirmed").order_by(Prebooking.updated_at))).all()
+        receipt_rows=(await ss.execute(select(PrebookingReceipt).where(
+            PrebookingReceipt.trip_id==tid,PrebookingReceipt.status=="approved"))).scalars().all()
+        btc_rows=(await ss.execute(select(BtcMembership))).scalars().all()
+    latest={}
+    for r in receipt_rows:
+        if r.telegram_id not in latest or (r.reviewed_at or r.submitted_at)>(latest[r.telegram_id].reviewed_at or latest[r.telegram_id].submitted_at):latest[r.telegram_id]=r
+    btc={b.telegram_id:b.btc_code for b in btc_rows}
+    out=io.StringIO();out.write("\ufeffنام و نام خانوادگی,موبایل,KZH,BTC,مبلغ پرداختی,تخفیف,تاریخ پیش‌رزرو,تاریخ تأیید,ادمین تأییدکننده\n")
+    def esc(v):return '"'+str(v or "").replace('"','""')+'"'
+    for pb,u in rows:
+        rr=latest.get(u.telegram_id)
+        vals=[u.full_name,u.phone,u.member_code,btc.get(u.telegram_id),pb.price_snapshot,pb.discount_snapshot,fdt(pb.created_at),fdt(rr.reviewed_at) if rr else "",rr.reviewed_by if rr else ""]
+        out.write(",".join(esc(v) for v in vals)+"\n")
+    data=out.getvalue().encode("utf-8")
+    await q.message.reply_document(document=InputFile(io.BytesIO(data),filename=f"confirmed_prebookings_{tid}.csv"),
+        caption=f"📊 رزروهای قطعی — {t.title}\nتعداد: {len(rows)}")
 
 
 JMONTHS=["فروردین","اردیبهشت","خرداد","تیر","مرداد","شهریور","مهر","آبان","آذر","دی","بهمن","اسفند"]
@@ -284,7 +433,8 @@ def akb(tid,x):
        InlineKeyboardButton(("🟢" if x.show_names else "⚪")+" نمایش اسامی",callback_data=f"pa:names:{tid}")],
       [InlineKeyboardButton("📣 گروه‌های انتشار پیش‌رزرو",callback_data=f"pa:publish:{tid}")],
       [InlineKeyboardButton("➕ افزودن دستی مسافر",callback_data=f"pa:add:{tid}")],
-      [InlineKeyboardButton("👥 مشاهده پیش‌رزروها",callback_data=f"pa:list:{tid}")]])
+      [InlineKeyboardButton("👥 مشاهده پیش‌رزروها",callback_data=f"pa:list:{tid}")],
+      [InlineKeyboardButton("📊 اکسل رزروهای قطعی",callback_data=f"pexport:confirmed:{tid}")]])
 
 async def panel(update,c):
     q=update.callback_query
@@ -525,4 +675,4 @@ async def initialize_prebooking(app):
     asyncio.create_task(loop(app))
 
 def handlers():
-    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search)]
+    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(receipt_review,pattern=r"^receipt:(approve|reject):\\d+$"),CallbackQueryHandler(receipt_trip_pick,pattern=r"^receipttrip:\\d+$"),CallbackQueryHandler(cancel_confirm,pattern=r"^preconfirm:(yes|no):\\d+$"),CallbackQueryHandler(export_confirmed,pattern=r"^pexport:confirmed:\\d+$"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\\d+$"),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE,receipt_photo),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search)]
