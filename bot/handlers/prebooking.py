@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, func, select
 from sqlalchemy.orm import Mapped, mapped_column
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from bot.db import Base, Activity, Trip, User
 
 log=logging.getLogger(__name__)
@@ -27,6 +27,21 @@ class PrebookingSettings(Base):
     show_names:Mapped[bool]=mapped_column(Boolean,default=True)
     chat_id:Mapped[int|None]=mapped_column(BigInteger,nullable=True)
     message_id:Mapped[int|None]=mapped_column(BigInteger,nullable=True)
+
+class PrebookingGroup(Base):
+    __tablename__="prebooking_groups"
+    chat_id:Mapped[int]=mapped_column(BigInteger,primary_key=True)
+    title:Mapped[str]=mapped_column(String(255),default="")
+    active:Mapped[bool]=mapped_column(Boolean,default=True)
+    updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
+
+class PrebookingPublication(Base):
+    __tablename__="prebooking_publications"
+    trip_id:Mapped[int]=mapped_column(Integer,primary_key=True)
+    chat_id:Mapped[int]=mapped_column(BigInteger,primary_key=True)
+    message_id:Mapped[int|None]=mapped_column(BigInteger,nullable=True)
+    active:Mapped[bool]=mapped_column(Boolean,default=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
 
 class Prebooking(Base):
     __tablename__="prebookings"
@@ -91,12 +106,22 @@ def public_kb(tid,full=False):
 
 async def refresh(c,tid):
     db=c.application.bot_data["db"]; x=await cfg(db,tid); t=await trip(db,tid)
-    if not x or not t or not x.chat_id or not x.message_id:return
+    if not x or not t:return
     a,_=await counts(db,tid)
-    try:await c.bot.edit_message_text(chat_id=x.chat_id,message_id=x.message_id,text=await text(db,t,x),
-                                      reply_markup=public_kb(tid,a>=x.capacity and x.waitlist))
-    except Exception as e:
-        if "not modified" not in str(e).lower():log.exception("prebooking refresh")
+    body=await text(db,t,x); kb=public_kb(tid,a>=x.capacity and x.waitlist)
+    async with db.sessions() as ss:
+        pubs=(await ss.execute(select(PrebookingPublication).where(
+            PrebookingPublication.trip_id==tid,PrebookingPublication.active.is_(True),
+            PrebookingPublication.message_id.is_not(None)))).scalars().all()
+    # Backward compatibility: update old single publication if it exists and was not migrated yet.
+    legacy=[]
+    if x.chat_id and x.message_id and not any(p.chat_id==x.chat_id for p in pubs):
+        legacy=[(x.chat_id,x.message_id)]
+    for chat_id,message_id in [(p.chat_id,p.message_id) for p in pubs]+legacy:
+        try:
+            await c.bot.edit_message_text(chat_id=chat_id,message_id=message_id,text=body,reply_markup=kb)
+        except Exception as e:
+            if "not modified" not in str(e).lower():log.exception("prebooking refresh chat=%s",chat_id)
 
 async def passenger(update:Update,c:ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; action,tid=q.data.split(":")[1:];tid=int(tid)
@@ -249,7 +274,7 @@ def akb(tid,x):
       [InlineKeyboardButton("📅 شروع بازه جریمه",callback_data=f"pa:penaltydate:{tid}"),InlineKeyboardButton("➖ امتیاز جریمه",callback_data=f"pa:cp:{tid}")],
       [InlineKeyboardButton(("🟢" if x.waitlist else "⚪")+" لیست انتظار",callback_data=f"pa:wait:{tid}"),
        InlineKeyboardButton(("🟢" if x.show_names else "⚪")+" نمایش اسامی",callback_data=f"pa:names:{tid}")],
-      [InlineKeyboardButton("📣 انتشار/بروزرسانی گروه",callback_data=f"pa:publish:{tid}")],
+      [InlineKeyboardButton("📣 گروه‌های انتشار پیش‌رزرو",callback_data=f"pa:publish:{tid}")],
       [InlineKeyboardButton("➕ افزودن دستی مسافر",callback_data=f"pa:add:{tid}")],
       [InlineKeyboardButton("👥 مشاهده پیش‌رزروها",callback_data=f"pa:list:{tid}")]])
 
@@ -257,7 +282,97 @@ async def panel(update,c):
     q=update.callback_query
     if not admin(q.from_user.id,c):return
     await q.answer();tid=int(q.data.split(":")[-1]);db=c.application.bot_data["db"];x=await cfg(db,tid,True);t=await trip(db,tid);a,w=await counts(db,tid)
-    await q.message.reply_text(f"🎟 تنظیمات پیش‌رزرو — {t.title}\n\nوضعیت: {'فعال' if x.enabled else 'غیرفعال'}\nظرفیت: {x.capacity} | ثبت: {a} | انتظار: {w}\nقیمت: {money(x.regular_price)}\nتخفیف: {money(x.early_discount)}\nمهلت: {fdt(x.deadline_at)}\nاجرای سفر: {fdt(x.execution_at)}\nجریمه: {x.cancel_points} امتیاز در {x.cancel_hours} ساعت مانده به اجرا",reply_markup=akb(tid,x))
+    await q.message.reply_text(f"🎟 تنظیمات پیش‌رزرو — {t.title}\n\nوضعیت: {'فعال' if x.enabled else 'غیرفعال'}\nظرفیت: {x.capacity} | ثبت: {a} | انتظار: {w}\nقیمت: {money(x.regular_price)}\nتخفیف: {money(x.early_discount)}\nمهلت: {fdt(x.deadline_at)}\nاجرای سفر: {fdt(x.execution_at)}\nشروع بازه جریمه: {fdt(x.cancel_from_at)}\nجریمه: {x.cancel_points} امتیاز",reply_markup=akb(tid,x))
+
+async def register_prebooking_group(update,c):
+    if not admin(update.effective_user.id,c):return
+    chat=update.effective_chat
+    if not chat or chat.type not in ("group","supergroup"):
+        await update.effective_message.reply_text("این دستور را داخل گروهی بزن که می‌خواهی پیش‌رزروها در آن قابل انتشار باشد.");return
+    db=c.application.bot_data["db"]
+    async with db.sessions() as ss:
+        g=(await ss.execute(select(PrebookingGroup).where(PrebookingGroup.chat_id==chat.id))).scalar_one_or_none()
+        if g:g.title=chat.title or str(chat.id);g.active=True;g.updated_at=datetime.now(timezone.utc)
+        else:ss.add(PrebookingGroup(chat_id=chat.id,title=chat.title or str(chat.id),active=True))
+        await ss.commit()
+    await update.effective_message.reply_text("✅ این گروه به مقصدهای انتشار پیش‌رزرو اضافه شد.\nاز این به بعد در پنل هر سفر می‌توانی انتخابش کنی.")
+
+async def publication_picker(q,c,tid):
+    db=c.application.bot_data["db"]
+    async with db.sessions() as ss:
+        groups=(await ss.execute(select(PrebookingGroup).where(PrebookingGroup.active.is_(True)).order_by(PrebookingGroup.title))).scalars().all()
+        selected=set((await ss.execute(select(PrebookingPublication.chat_id).where(
+            PrebookingPublication.trip_id==tid,PrebookingPublication.active.is_(True)))).scalars().all())
+    if not groups:
+        await q.message.reply_text("هنوز هیچ گروهی برای انتشار پیش‌رزرو ثبت نشده.\n\nداخل هر گروه موردنظر یک‌بار دستور /prebookinggroup را بزن، بعد برگرد اینجا.");return
+    rows=[]
+    for g in groups:
+        mark="✅" if g.chat_id in selected else "⬜"
+        rows.append([InlineKeyboardButton(f"{mark} {g.title}"[:60],callback_data=f"ppub:toggle:{tid}:{g.chat_id}")])
+    rows += [[InlineKeyboardButton("📣 انتشار / بروزرسانی در گروه‌های انتخاب‌شده",callback_data=f"ppub:send:{tid}")],
+             [InlineKeyboardButton("🗑 حذف پیام از گروه‌های ازانتخاب‌خارج‌شده",callback_data=f"ppub:cleanup:{tid}")]]
+    await q.message.reply_text("📣 گروه‌های انتشار پیش‌رزرو\n\nیک یا چند گروه را انتخاب کن. این بخش مستقل از «ثبت سفرهای من» است.",reply_markup=InlineKeyboardMarkup(rows))
+
+async def publication_cb(update,c):
+    q=update.callback_query
+    if not admin(q.from_user.id,c):return
+    await q.answer();z=q.data.split(":");act=z[1];tid=int(z[2]);db=c.application.bot_data["db"]
+    if act=="toggle":
+        chat_id=int(z[3])
+        async with db.sessions() as ss:
+            pub=(await ss.execute(select(PrebookingPublication).where(
+                PrebookingPublication.trip_id==tid,PrebookingPublication.chat_id==chat_id))).scalar_one_or_none()
+            if pub:pub.active=not pub.active
+            else:ss.add(PrebookingPublication(trip_id=tid,chat_id=chat_id,active=True))
+            await ss.commit()
+        await q.edit_message_reply_markup(reply_markup=(await _publication_keyboard(db,tid)));return
+    if act=="send":
+        x=await cfg(db,tid);t=await trip(db,tid)
+        if not x.enabled or x.capacity<=0:
+            await q.answer("اول پیش‌رزرو را فعال و ظرفیت را تعیین کن.",show_alert=True);return
+        aa,_=await counts(db,tid);body=await text(db,t,x);kb=public_kb(tid,aa>=x.capacity and x.waitlist)
+        async with db.sessions() as ss:
+            pubs=(await ss.execute(select(PrebookingPublication).where(
+                PrebookingPublication.trip_id==tid,PrebookingPublication.active.is_(True)))).scalars().all()
+            if not pubs:
+                await q.answer("حداقل یک گروه انتخاب کن.",show_alert=True);return
+            ok=0;failed=0
+            for pub in pubs:
+                try:
+                    if pub.message_id:
+                        try:
+                            await c.bot.edit_message_text(chat_id=pub.chat_id,message_id=pub.message_id,text=body,reply_markup=kb)
+                        except Exception as e:
+                            if "not modified" not in str(e).lower(): raise
+                    else:
+                        m=await c.bot.send_message(pub.chat_id,body,reply_markup=kb);pub.message_id=m.message_id
+                    ok+=1
+                except Exception:
+                    failed+=1;log.exception("publish prebooking chat=%s",pub.chat_id)
+            await ss.commit()
+        await q.answer(f"انجام شد: {ok} گروه" + (f" | خطا: {failed}" if failed else ""),show_alert=True);return
+    if act=="cleanup":
+        async with db.sessions() as ss:
+            pubs=(await ss.execute(select(PrebookingPublication).where(
+                PrebookingPublication.trip_id==tid,PrebookingPublication.active.is_(False),
+                PrebookingPublication.message_id.is_not(None)))).scalars().all()
+            removed=0
+            for pub in pubs:
+                try:await c.bot.delete_message(pub.chat_id,pub.message_id);removed+=1
+                except Exception:log.exception("delete prebooking publication chat=%s",pub.chat_id)
+                pub.message_id=None
+            await ss.commit()
+        await q.answer(f"{removed} پیام حذف شد.",show_alert=True)
+
+async def _publication_keyboard(db,tid):
+    async with db.sessions() as ss:
+        groups=(await ss.execute(select(PrebookingGroup).where(PrebookingGroup.active.is_(True)).order_by(PrebookingGroup.title))).scalars().all()
+        selected=set((await ss.execute(select(PrebookingPublication.chat_id).where(
+            PrebookingPublication.trip_id==tid,PrebookingPublication.active.is_(True)))).scalars().all())
+    rows=[[InlineKeyboardButton(f"{'✅' if g.chat_id in selected else '⬜'} {g.title}"[:60],callback_data=f"ppub:toggle:{tid}:{g.chat_id}")] for g in groups]
+    rows += [[InlineKeyboardButton("📣 انتشار / بروزرسانی در گروه‌های انتخاب‌شده",callback_data=f"ppub:send:{tid}")],
+             [InlineKeyboardButton("🗑 حذف پیام از گروه‌های ازانتخاب‌خارج‌شده",callback_data=f"ppub:cleanup:{tid}")]]
+    return InlineKeyboardMarkup(rows)
 
 async def action(update,c):
     q=update.callback_query
@@ -279,17 +394,7 @@ async def action(update,c):
     if a=="add":
         return await preadd_start(update,c)
     if a=="publish":
-        t=await trip(db,tid)
-        if not x.enabled or x.capacity<=0:await q.message.reply_text("اول پیش‌رزرو را فعال و ظرفیت را تعیین کن.");return ConversationHandler.END
-        target=t.telegram_chat_id or c.application.bot_data["settings"].group_chat_id
-        if not target:await q.message.reply_text("گروه انتشار مشخص نیست.");return ConversationHandler.END
-        aa,_=await counts(db,tid)
-        if x.chat_id and x.message_id:
-            await refresh(c,tid);await q.message.reply_text("✅ پیام قبلی بروزرسانی شد.");return ConversationHandler.END
-        m=await c.bot.send_message(target,await text(db,t,x),reply_markup=public_kb(tid,aa>=x.capacity and x.waitlist))
-        async with db.sessions() as s:
-            z=(await s.execute(select(PrebookingSettings).where(PrebookingSettings.trip_id==tid))).scalar_one();z.chat_id=target;z.message_id=m.message_id;await s.commit()
-        await q.message.reply_text("✅ در گروه منتشر شد.");return ConversationHandler.END
+        await publication_picker(q,c,tid);return ConversationHandler.END
     if a=="list":
         async with db.sessions() as s:
             rows=(await s.execute(select(User.full_name,Prebooking.status,Prebooking.price_snapshot,Prebooking.discount_snapshot).join(Prebooking,Prebooking.telegram_id==User.telegram_id).where(Prebooking.trip_id==tid).order_by(Prebooking.created_at))).all()
@@ -386,7 +491,7 @@ async def loop(app):
     while True:
         try:
             db=app.bot_data["db"]
-            async with db.sessions() as s:ids=(await s.execute(select(PrebookingSettings.trip_id).where(PrebookingSettings.enabled.is_(True),PrebookingSettings.message_id.is_not(None)))).scalars().all()
+            async with db.sessions() as s:ids=(await s.execute(select(PrebookingPublication.trip_id).join(PrebookingSettings,PrebookingSettings.trip_id==PrebookingPublication.trip_id).where(PrebookingSettings.enabled.is_(True),PrebookingPublication.active.is_(True),PrebookingPublication.message_id.is_not(None)).distinct())).scalars().all()
             ctx=type("C",(),{"application":app,"bot":app.bot})()
             for tid in ids:await refresh(ctx,tid)
         except Exception:log.exception("prebooking timer")
@@ -397,7 +502,14 @@ async def initialize_prebooking(app):
     async with app.bot_data["db"].engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(sql_text("ALTER TABLE prebooking_settings ADD COLUMN IF NOT EXISTS cancel_from_at TIMESTAMPTZ"))
+        await conn.execute(sql_text("""
+            INSERT INTO prebooking_publications (trip_id, chat_id, message_id, active, created_at)
+            SELECT trip_id, chat_id, message_id, TRUE, NOW()
+            FROM prebooking_settings
+            WHERE chat_id IS NOT NULL AND message_id IS NOT NULL
+            ON CONFLICT (trip_id, chat_id) DO NOTHING
+        """))
     asyncio.create_task(loop(app))
 
 def handlers():
-    return [flow(),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine)]
+    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search)]
