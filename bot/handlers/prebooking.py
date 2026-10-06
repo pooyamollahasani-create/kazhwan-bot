@@ -9,7 +9,7 @@ from bot.db import Base, Activity, Trip, User
 
 log=logging.getLogger(__name__)
 IR=ZoneInfo("Asia/Tehran")
-CAP,PRICE,DISC,DEADLINE,EXECUTE,CANCEL_HOURS,CANCEL_POINTS=range(700,707)
+CAP,PRICE,DISC,DEADLINE,EXECUTE,CANCEL_HOURS,CANCEL_POINTS,PAY_ACCOUNT,PAY_NAME=range(700,709)
 
 class PrebookingSettings(Base):
     __tablename__="prebooking_settings"
