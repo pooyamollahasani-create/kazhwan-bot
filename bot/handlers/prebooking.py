@@ -159,9 +159,9 @@ async def action(update,c):
         await q.message.reply_text("✅ تغییر کرد.");await refresh(c,tid);return ConversationHandler.END
     states={"cap":CAP,"price":PRICE,"disc":DISC,"deadline":DEADLINE,"execute":EXECUTE,"ch":CANCEL_HOURS,"cp":CANCEL_POINTS}
     if a in states:
-        c.user_data["pre_tid"]=tid;c.user_data["pre_state"]=states[a]
+        c.user_data["pre_tid"]=tid;c.user_data["pre_state"]=states[a];c.user_data["pre_waiting"]=True
         prompts={"cap":"ظرفیت کل؟ فقط عدد","price":"قیمت اصلی به تومان؟ فقط عدد","disc":"تخفیف پیش‌رزرو به تومان؟ فقط عدد","deadline":"مهلت پیش‌رزرو؟ مثال: 2026-10-20 18:00 (ساعت ایران)","execute":"تاریخ و ساعت اجرای سفر؟ مثال: 2026-10-24 06:00 (ساعت ایران)","ch":"از چند ساعت مانده به اجرا کنسلی جریمه دارد؟","cp":"جریمه چند امتیاز باشد؟"}
-        await q.message.reply_text(prompts[a]);return states[a]
+        await q.message.reply_text(prompts[a]);return ConversationHandler.END
     if a=="publish":
         t=await trip(db,tid)
         if not x.enabled or x.capacity<=0:await q.message.reply_text("اول پیش‌رزرو را فعال و ظرفیت را تعیین کن.");return ConversationHandler.END
@@ -184,17 +184,25 @@ async def action(update,c):
 async def value(update,c):
     st=c.user_data["pre_state"];tid=c.user_data["pre_tid"];v=(update.message.text or "").strip();db=c.application.bot_data["db"]
     try:
+        trans=str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩","01234567890123456789")
+        v=v.translate(trans).strip().replace("／","/").replace("–","-").replace("—","-")
         async with db.sessions() as s:
             x=(await s.execute(select(PrebookingSettings).where(PrebookingSettings.trip_id==tid))).scalar_one()
             if st in (DEADLINE,EXECUTE):
-                d=datetime.strptime(v,"%Y-%m-%d %H:%M").replace(tzinfo=IR).astimezone(timezone.utc);setattr(x,"deadline_at" if st==DEADLINE else "execution_at",d)
+                parsed=None
+                for fmt in ("%Y-%m-%d %H:%M","%Y/%m/%d %H:%M"):
+                    try:
+                        parsed=datetime.strptime(v,fmt);break
+                    except ValueError: pass
+                if parsed is None: raise ValueError("bad datetime")
+                d=parsed.replace(tzinfo=IR).astimezone(timezone.utc);setattr(x,"deadline_at" if st==DEADLINE else "execution_at",d)
             else:
                 n=int(v.replace(",","").replace("٬",""));assert n>=0
                 setattr(x,{CAP:"capacity",PRICE:"regular_price",DISC:"early_discount",CANCEL_HOURS:"cancel_hours",CANCEL_POINTS:"cancel_points"}[st],n)
             await s.commit()
-        await update.message.reply_text("✅ ذخیره شد.");await refresh(c,tid);return ConversationHandler.END
+        c.user_data.pop("pre_waiting",None);c.user_data.pop("pre_state",None);c.user_data.pop("pre_tid",None);await update.message.reply_text("✅ ذخیره شد.");await refresh(c,tid);return ConversationHandler.END
     except Exception:
-        await update.message.reply_text("فرمت درست نیست؛ دوباره وارد کن.");return st
+        await update.message.reply_text("فرمت درست نیست. تاریخ را مثل 2026-10-08 11:00 یا 2026/10/08 11:00 وارد کن.");return st
 
 async def mine(update,c):
     db=c.application.bot_data["db"]
@@ -204,6 +212,11 @@ async def mine(update,c):
     lab={"prebooked":"🟡 پیش‌رزرو","confirmed":"🟢 قطعی","waitlist":"⏳ انتظار"};lines=["📝 ثبت‌نام‌های من",""]
     for r,t in rows:lines += [f"{lab.get(r.status,r.status)} — {t.title}",f"💳 مبلغ: {money(r.price_snapshot)}",f"🎁 تخفیف: {money(r.discount_snapshot)}",""]
     await update.message.reply_text("\n".join(lines))
+
+async def pending_admin_value(update,c):
+    if not admin(update.effective_user.id,c) or not c.user_data.get("pre_waiting"):
+        return
+    return await value(update,c)
 
 def flow():
     return ConversationHandler(entry_points=[CallbackQueryHandler(panel,pattern=r"^pa:view:\d+$"),CallbackQueryHandler(action,pattern=r"^pa:(toggle|wait|names|publish|list|cap|price|disc|deadline|execute|ch|cp):\d+$")],
