@@ -12,6 +12,7 @@ EDIT_VALUE, EDIT_PHONE, EDIT_SOURCE, EDIT_SOURCE_OTHER = range(4)
 
 def _profile_actions_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎟 پیش‌رزروهای من", callback_data="preprofile:open")],
         [InlineKeyboardButton("✏️ ویرایش پروفایل", callback_data="profileedit:open")]
     ])
 

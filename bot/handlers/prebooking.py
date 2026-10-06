@@ -674,5 +674,71 @@ async def initialize_prebooking(app):
         """))
     asyncio.create_task(loop(app))
 
+async def profile_prebookings(update,c):
+    q=update.callback_query
+    await q.answer()
+    db=c.application.bot_data["db"];uid=q.from_user.id
+    async with db.sessions() as ss:
+        rows=(await ss.execute(select(Prebooking,Trip).join(Trip,Trip.id==Prebooking.trip_id).where(
+            Prebooking.telegram_id==uid,Prebooking.status.in_(["prebooked","confirmed","waitlist"])
+        ).order_by(Prebooking.created_at.desc()))).all()
+        receipts=(await ss.execute(select(PrebookingReceipt).where(
+            PrebookingReceipt.telegram_id==uid).order_by(PrebookingReceipt.submitted_at.desc()))).scalars().all()
+    if not rows:
+        await q.message.reply_text("🎟 پیش‌رزروهای من\n\nدر حال حاضر پیش‌رزرو فعالی ندارید.");return
+    latest={}
+    for rr in receipts:
+        if rr.trip_id not in latest:latest[rr.trip_id]=rr
+    status_label={"prebooked":"🟡 پیش‌رزرو","confirmed":"🟢 رزرو قطعی","waitlist":"⏳ لیست انتظار"}
+    receipt_label={"pending":"⏳ رسید در حال بررسی","approved":"✅ پرداخت تأیید شده","rejected":"❌ رسید رد شده"}
+    rows_kb=[]
+    for pb,t in rows:
+        rr=latest.get(t.id)
+        pay_state=receipt_label.get(rr.status,"💳 در انتظار پرداخت") if rr else "💳 در انتظار پرداخت"
+        rows_kb.append([InlineKeyboardButton(f"{status_label.get(pb.status,pb.status)} | {t.title}"[:60],callback_data=f"preprofile:view:{t.id}")])
+        if pb.status=="prebooked":
+            rows_kb.append([InlineKeyboardButton(f"💳 پرداخت و بررسی ثبت‌نام | {pay_state}"[:60],callback_data=f"preprofile:payment:{t.id}")])
+        elif pb.status=="confirmed":
+            rows_kb.append([InlineKeyboardButton("✅ مشاهده تأیید رزرو",callback_data=f"preprofile:payment:{t.id}")])
+    await q.message.reply_text("🎟 پیش‌رزروهای من\n\nسفر موردنظر را انتخاب کنید:",reply_markup=InlineKeyboardMarkup(rows_kb))
+
+async def profile_prebooking_cb(update,c):
+    q=update.callback_query;await q.answer()
+    z=q.data.split(":");act=z[1];tid=int(z[2]);uid=q.from_user.id;db=c.application.bot_data["db"]
+    async with db.sessions() as ss:
+        pb=(await ss.execute(select(Prebooking).where(Prebooking.trip_id==tid,Prebooking.telegram_id==uid))).scalar_one_or_none()
+        t=(await ss.execute(select(Trip).where(Trip.id==tid))).scalar_one_or_none()
+        x=(await ss.execute(select(PrebookingSettings).where(PrebookingSettings.trip_id==tid))).scalar_one_or_none()
+        rr=(await ss.execute(select(PrebookingReceipt).where(
+            PrebookingReceipt.trip_id==tid,PrebookingReceipt.telegram_id==uid
+        ).order_by(PrebookingReceipt.submitted_at.desc()).limit(1))).scalar_one_or_none()
+    if not pb or not t:
+        await q.message.reply_text("این پیش‌رزرو پیدا نشد.");return
+    sl={"prebooked":"🟡 پیش‌رزرو","confirmed":"🟢 رزرو قطعی","waitlist":"⏳ لیست انتظار","cancelled":"⚪ لغو"}
+    if act=="view":
+        await q.message.reply_text(
+            f"🧳 {t.title}\n"
+            f"وضعیت: {sl.get(pb.status,pb.status)}\n"
+            f"💰 مبلغ ثبت‌شده: {money(pb.price_snapshot)}\n"
+            f"🎁 تخفیف: {money(pb.discount_snapshot)}\n"
+            f"📅 ثبت پیش‌رزرو: {fdt(pb.created_at)}")
+        return
+    if pb.status=="confirmed":
+        await q.message.reply_text(f"✅ رزرو «{t.title}» قطعی است و پرداخت شما تأیید شده.");return
+    if pb.status=="waitlist":
+        await q.message.reply_text(f"⏳ شما برای «{t.title}» در لیست انتظار هستید. هنوز نیازی به پرداخت نیست.");return
+    state="💳 هنوز رسیدی ثبت نشده."
+    if rr:
+        state={"pending":"⏳ رسید شما ارسال شده و در حال بررسی ادمین است.","approved":"✅ پرداخت تأیید شده است.","rejected":"❌ رسید قبلی تأیید نشده؛ می‌توانید رسید صحیح را دوباره بفرستید."}.get(rr.status,state)
+    account=html.escape((x.payment_account if x else "") or "شماره پرداخت هنوز ثبت نشده")
+    recipient=html.escape((x.payment_recipient if x else "") or "")
+    await q.message.reply_text(
+        f"💳 پرداخت — «{html.escape(t.title)}»\n\n"
+        f"💰 مبلغ قابل پرداخت: {money(pb.price_snapshot)}\n"
+        f"💳 شماره کارت/حساب/شبا:\n<code>{account}</code>"
+        + (f"\n👤 به نام: {recipient}" if recipient else "")
+        + f"\n\n{state}\n\nبرای ارسال یا اصلاح رسید، عکس رسید را همین‌جا در PV بفرستید.",
+        parse_mode="HTML")
+
 def handlers():
-    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(receipt_review,pattern=r"^receipt:(approve|reject):\\d+$"),CallbackQueryHandler(receipt_trip_pick,pattern=r"^receipttrip:\\d+$"),CallbackQueryHandler(cancel_confirm,pattern=r"^preconfirm:(yes|no):\\d+$"),CallbackQueryHandler(export_confirmed,pattern=r"^pexport:confirmed:\\d+$"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\\d+$"),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE,receipt_photo),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search)]
+    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(receipt_review,pattern=r"^receipt:(approve|reject):\d+$"),CallbackQueryHandler(receipt_trip_pick,pattern=r"^receipttrip:\d+$"),CallbackQueryHandler(cancel_confirm,pattern=r"^preconfirm:(yes|no):\d+$"),CallbackQueryHandler(export_confirmed,pattern=r"^pexport:confirmed:\d+$"),CallbackQueryHandler(profile_prebookings,pattern=r"^preprofile:open$"),CallbackQueryHandler(profile_prebooking_cb,pattern=r"^preprofile:(view|payment):\d+$"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE,receipt_photo),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search)]
