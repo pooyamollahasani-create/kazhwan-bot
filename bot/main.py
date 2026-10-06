@@ -7,6 +7,8 @@ from bot.handlers.admin import admin_handlers
 from bot.handlers.menu import menu_handlers
 from bot.handlers.moderation import initialize_quiet_hours,moderation_handlers
 from bot.handlers.onboarding import build_onboarding_handler
+from bot.prebooking_onboarding_patch import install as install_prebooking_onboarding
+install_prebooking_onboarding()
 from bot.handlers.trips import trip_handlers
 from bot.handlers.feedback import feedback_handlers
 from bot.handlers.broadcast import broadcast_handlers
@@ -24,7 +26,7 @@ async def post_init(application:Application)->None:
  db=application.bot_data["db"];settings=application.bot_data["settings"];await db.init();await initialize_prebooking(application);await initialize_quiet_hours(application)
  private_user_commands=[("start","شروع و تکمیل پروفایل کژوان")]
  group_user_commands=[("tripinfo","اطلاعات سفر این گروه")]
- group_admin_commands=[("settrip","تعریف یا ویرایش سفر این گروه"),("tripinfo","اطلاعات سفر این گروه"),("tripregister","انتشار دکمه ثبت سفر برای مسافران"),("chatid","نمایش شناسه عددی گروه"),("quieton","بستن دستی چت گروه"),("quietoff","باز کردن دستی چت گروه"),("cancel","توقف فرآیند جاری")]
+ group_admin_commands=[("settrip","تعریف یا ویرایش سفر این گروه"),("tripinfo","اطلاعات سفر این گروه"),("tripregister","انتشار دکمه ثبت سفر برای مسافران"),("chatid","نمایش شناسه عددی گروه"),("quieton","بستن دستی چت گروه"),("quietoff","باز کردن دستی چت گروه"),("prebookinggroup","افزودن گروه به مقصدهای پیش‌رزرو"),("cancel","توقف فرآیند جاری")]
  private_admin_commands=[("start","شروع و تکمیل پروفایل کژوان"),("admin","پنل مدیریت"),("broadcast","ارسال پیام همگانی"),("stats","آمار مدیریتی"),("members","تعداد اعضای ثبت‌شده"),("member","جستجوی عضو"),("inactive30","غیرفعال بیش از ۳۰ روز"),("inactive60","غیرفعال بیش از ۶۰ روز"),("topreferrals","معرف‌های برتر"),("exportmembers","خروجی Excel اعضا"),("exportinactive","خروجی Excel غیرفعال‌ها"),("exportreferrals","خروجی Excel معرف‌ها"),("exportall","خروجی کامل مدیریتی"),("cancel","توقف فرآیند جاری")]
  await application.bot.delete_my_commands();await application.bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats());await application.bot.delete_my_commands(scope=BotCommandScopeAllGroupChats());await application.bot.delete_my_commands(scope=BotCommandScopeAllChatAdministrators())
  for aid in settings.admin_ids:
