@@ -134,36 +134,45 @@ async def passenger(update:Update,c:ContextTypes.DEFAULT_TYPE):
 JMONTHS=["فروردین","اردیبهشت","خرداد","تیر","مرداد","شهریور","مهر","آبان","آذر","دی","بهمن","اسفند"]
 JWD=["ش","ی","د","س","چ","پ","ج"]
 
-def _g2d(gy,gm,gd):
-    d=(gy+(gm-8)//6+100100)*1461//4+(153*((gm+9)%12)+2)//5+gd-34840408
-    d=d-(gy+100100+(gm-8)//6)//100*3//4+752
-    return d
-def _d2g(jdn):
-    j=4*jdn+139361631
-    j=j+(((4*jdn+183187720)//146097)*3//4)*4-3908
-    i=((j%1461)//4)*5+308
-    gd=(i%153)//5+1;gm=(i//153)%12+1;gy=j//1461-100100+(8-gm)//6
-    return gy,gm,gd
-def _j2d(jy,jm,jd):
-    jy2=jy+1595
-    days=-355668+365*jy2+(jy2//33)*8+((jy2%33)+3)//4+jd
-    days+=(jm-1)*31 if jm<7 else 186+(jm-7)*30
-    return days+2400000
-def _d2j(jdn):
-    gy,gm,gd=_d2g(jdn); jy=gy-621
-    march=_j2d(jy,1,1); k=jdn-march
-    if k>=0:
-        if k<=185:return jy,1+k//31,1+k%31
-        k-=186
+def gregorian_to_jalali(gy,gm,gd):
+    gdm=[0,31,59,90,120,151,181,212,243,273,304,334]
+    gy2=gy+1 if gm>2 else gy
+    days=355666+365*gy+(gy2+3)//4-(gy2+99)//100+(gy2+399)//400+gd+gdm[gm-1]
+    jy=-1595+33*(days//12053);days%=12053
+    jy+=4*(days//1461);days%=1461
+    if days>365:
+        jy+=(days-1)//365;days=(days-1)%365
+    if days<186:
+        jm=1+days//31;jd=1+days%31
     else:
-        jy-=1;k=jdn-_j2d(jy,1,1);k-=186
-    return jy,7+k//30,1+k%30
-def jalali_to_gregorian(jy,jm,jd): return _d2g(_j2d(jy,jm,jd))
-def gregorian_to_jalali(gy,gm,gd): return _d2j(_g2d(gy,gm,gd))
+        jm=7+(days-186)//30;jd=1+(days-186)%30
+    return jy,jm,jd
+
+def jalali_to_gregorian(jy,jm,jd):
+    jy+=1595
+    days=-355668+365*jy+(jy//33)*8+((jy%33)+3)//4+jd
+    days+=(jm-1)*31 if jm<7 else (jm-7)*30+186
+    gy=400*(days//146097);days%=146097
+    if days>36524:
+        gy+=100*((days-1)//36524);days=(days-1)%36524
+        if days>=365:days+=1
+    gy+=4*(days//1461);days%=1461
+    if days>365:
+        gy+=(days-1)//365;days=(days-1)%365
+    gd=days+1
+    leap=(gy%4==0 and gy%100!=0) or gy%400==0
+    sal=[0,31,29 if leap else 28,31,30,31,30,31,31,30,31,30,31]
+    gm=1
+    while gm<=12 and gd>sal[gm]:
+        gd-=sal[gm];gm+=1
+    return gy,gm,gd
+
 def jmonth_days(jy,jm):
     if jm<=6:return 31
     if jm<=11:return 30
-    return 30 if _j2d(jy+1,1,1)-_j2d(jy,1,1)==366 else 29
+    gy1,gm1,gd1=jalali_to_gregorian(jy,1,1)
+    gy2,gm2,gd2=jalali_to_gregorian(jy+1,1,1)
+    return 30 if (datetime(gy2,gm2,gd2)-datetime(gy1,gm1,gd1)).days==366 else 29
 
 def cal_kb(tid,kind,jy,jm):
     rows=[[InlineKeyboardButton("◀️",callback_data=f"pc:nav:{tid}:{kind}:{jy}:{jm}:-1"),
