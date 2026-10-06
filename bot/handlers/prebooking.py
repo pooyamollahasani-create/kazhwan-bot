@@ -5,7 +5,7 @@ from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, func, sel
 from sqlalchemy.orm import Mapped, mapped_column
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
-from bot.db import Base, Activity, Trip, User, BtcMembership
+from bot.db import Base, Activity, Trip, User, BtcMembership, TripParticipant
 
 log=logging.getLogger(__name__)
 IR=ZoneInfo("Asia/Tehran")
@@ -655,6 +655,40 @@ async def loop(app):
             async with db.sessions() as s:ids=(await s.execute(select(PrebookingPublication.trip_id).join(PrebookingSettings,PrebookingSettings.trip_id==PrebookingPublication.trip_id).where(PrebookingSettings.enabled.is_(True),PrebookingPublication.active.is_(True),PrebookingPublication.message_id.is_not(None)).distinct())).scalars().all()
             ctx=type("C",(),{"application":app,"bot":app.bot})()
             for tid in ids:await refresh(ctx,tid)
+
+            # رزرو قطعی + رسید تاییدشده + رسیدن زمان اجرای سفر
+            # => ثبت خودکار مسافر به عنوان «شرکت کرده» در سفرهای من.
+            now=datetime.now(timezone.utc)
+            async with db.sessions() as s:
+                due=(await s.execute(
+                    select(Prebooking.trip_id,Prebooking.telegram_id)
+                    .join(PrebookingSettings,PrebookingSettings.trip_id==Prebooking.trip_id)
+                    .join(PrebookingReceipt,
+                          (PrebookingReceipt.trip_id==Prebooking.trip_id) &
+                          (PrebookingReceipt.telegram_id==Prebooking.telegram_id))
+                    .where(
+                        Prebooking.status=="confirmed",
+                        PrebookingReceipt.status=="approved",
+                        PrebookingSettings.execution_at.is_not(None),
+                        PrebookingSettings.execution_at<=now
+                    ).distinct()
+                )).all()
+            for tid,uid in due:
+                async with db.sessions() as s:
+                    participant=(await s.execute(select(TripParticipant).where(
+                        TripParticipant.trip_id==tid,
+                        TripParticipant.telegram_id==uid
+                    ))).scalar_one_or_none()
+                if participant and participant.status=="attended":
+                    continue
+                await db.register_trip_participant(tid,uid)
+                await db.set_trip_participant_status(tid,uid,"attended")
+                try:
+                    t=await db.get_trip(tid)
+                    await app.bot.send_message(uid,
+                        f"✅ سفر «{t.title if t else 'کژوان'}» به‌صورت خودکار در تاریخچه سفرهای شما به عنوان «شرکت کرده» ثبت شد.")
+                except Exception:
+                    log.exception("auto attendance notification trip=%s user=%s",tid,uid)
         except Exception:log.exception("prebooking timer")
         await asyncio.sleep(3600)
 
