@@ -21,6 +21,7 @@ class PrebookingSettings(Base):
     deadline_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
     execution_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
     cancel_hours:Mapped[int]=mapped_column(Integer,default=0)
+    cancel_from_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
     cancel_points:Mapped[int]=mapped_column(Integer,default=0)
     waitlist:Mapped[bool]=mapped_column(Boolean,default=True)
     show_names:Mapped[bool]=mapped_column(Boolean,default=True)
@@ -120,7 +121,8 @@ async def passenger(update:Update,c:ContextTypes.DEFAULT_TYPE):
         else:
             if not r or r.status not in ("prebooked","confirmed","waitlist"):await q.answer("رزرو فعالی ندارید.",show_alert=True);return
             active=r.status in ("prebooked","confirmed"); penalty=0
-            if active and x.execution_at and x.cancel_hours and x.cancel_points and now>=aware(x.execution_at)-timedelta(hours=x.cancel_hours):
+            penalty_start=aware(x.cancel_from_at) if x.cancel_from_at else (aware(x.execution_at)-timedelta(hours=x.cancel_hours) if x.execution_at and x.cancel_hours else None)
+            if active and penalty_start and x.cancel_points and now>=penalty_start:
                 penalty=min(int(u.points or 0),x.cancel_points);u.points=int(u.points or 0)-penalty;r.penalty_points=penalty
                 if penalty:s.add(Activity(telegram_id=u.telegram_id,activity_type="prebooking_cancel_penalty",title=f"جریمه لغو دیرهنگام {t.title}",details=f"-{penalty} امتیاز"))
             r.status="cancelled";r.updated_at=now
@@ -204,7 +206,7 @@ def minute_kb(tid,kind,jy,jm,jd,h):
 
 async def calendar_start(q,tid,kind):
     now=datetime.now(IR);jy,jm,jd=gregorian_to_jalali(now.year,now.month,now.day)
-    title="مهلت پیش‌رزرو" if kind=="deadline" else "زمان اجرای سفر"
+    title={"deadline":"مهلت پیش‌رزرو","execute":"زمان اجرای سفر","penalty":"شروع بازه جریمه"}[kind]
     await q.message.reply_text(f"📅 {title}\nتاریخ شمسی را انتخاب کن:",reply_markup=cal_kb(tid,kind,jy,jm))
 
 async def calendar_cb(update,c):
@@ -233,8 +235,8 @@ async def calendar_cb(update,c):
         db=c.application.bot_data["db"]
         async with db.sessions() as ss:
             x=(await ss.execute(select(PrebookingSettings).where(PrebookingSettings.trip_id==tid))).scalar_one()
-            setattr(x,"deadline_at" if kind=="deadline" else "execution_at",utc);await ss.commit()
-        label="مهلت پیش‌رزرو" if kind=="deadline" else "زمان اجرای سفر"
+            setattr(x,{"deadline":"deadline_at","execute":"execution_at","penalty":"cancel_from_at"}[kind],utc);await ss.commit()
+        label={"deadline":"مهلت پیش‌رزرو","execute":"زمان اجرای سفر","penalty":"شروع بازه جریمه"}[kind]
         await q.edit_message_text(f"✅ {label} ذخیره شد:\n📅 {jd} {JMONTHS[jm-1]} {jy}\n🕐 {h:02d}:{m:02d}")
         await refresh(c,tid)
 
@@ -244,10 +246,11 @@ def akb(tid,x):
       [InlineKeyboardButton("👥 ظرفیت",callback_data=f"pa:cap:{tid}"),InlineKeyboardButton("💰 قیمت",callback_data=f"pa:price:{tid}")],
       [InlineKeyboardButton("🎁 تخفیف تومانی",callback_data=f"pa:disc:{tid}"),InlineKeyboardButton("⏳ مهلت پیش‌رزرو",callback_data=f"pa:deadline:{tid}")],
       [InlineKeyboardButton("🚌 زمان اجرای سفر",callback_data=f"pa:execute:{tid}")],
-      [InlineKeyboardButton("🕒 بازه جریمه",callback_data=f"pa:ch:{tid}"),InlineKeyboardButton("➖ امتیاز جریمه",callback_data=f"pa:cp:{tid}")],
+      [InlineKeyboardButton("📅 شروع بازه جریمه",callback_data=f"pa:penaltydate:{tid}"),InlineKeyboardButton("➖ امتیاز جریمه",callback_data=f"pa:cp:{tid}")],
       [InlineKeyboardButton(("🟢" if x.waitlist else "⚪")+" لیست انتظار",callback_data=f"pa:wait:{tid}"),
        InlineKeyboardButton(("🟢" if x.show_names else "⚪")+" نمایش اسامی",callback_data=f"pa:names:{tid}")],
       [InlineKeyboardButton("📣 انتشار/بروزرسانی گروه",callback_data=f"pa:publish:{tid}")],
+      [InlineKeyboardButton("➕ افزودن دستی مسافر",callback_data=f"pa:add:{tid}")],
       [InlineKeyboardButton("👥 مشاهده پیش‌رزروها",callback_data=f"pa:list:{tid}")]])
 
 async def panel(update,c):
@@ -265,14 +268,16 @@ async def action(update,c):
             z=(await s.execute(select(PrebookingSettings).where(PrebookingSettings.trip_id==tid))).scalar_one()
             attr={"toggle":"enabled","wait":"waitlist","names":"show_names"}[a];setattr(z,attr,not getattr(z,attr));await s.commit()
         await q.message.reply_text("✅ تغییر کرد.");await refresh(c,tid);return ConversationHandler.END
-    if a in ("deadline","execute"):
-        await calendar_start(q,tid,a)
+    if a in ("deadline","execute","penaltydate"):
+        await calendar_start(q,tid,"penalty" if a=="penaltydate" else a)
         return ConversationHandler.END
-    states={"cap":CAP,"price":PRICE,"disc":DISC,"ch":CANCEL_HOURS,"cp":CANCEL_POINTS}
+    states={"cap":CAP,"price":PRICE,"disc":DISC,"cp":CANCEL_POINTS}
     if a in states:
         c.user_data["pre_tid"]=tid;c.user_data["pre_state"]=states[a]
-        prompts={"cap":"ظرفیت کل؟ فقط عدد","price":"قیمت اصلی به تومان؟ فقط عدد","disc":"تخفیف پیش‌رزرو به تومان؟ فقط عدد","ch":"از چند ساعت مانده به اجرا کنسلی جریمه دارد؟","cp":"جریمه چند امتیاز باشد؟"}
+        prompts={"cap":"ظرفیت کل؟ فقط عدد","price":"قیمت اصلی به تومان؟ فقط عدد","disc":"تخفیف پیش‌رزرو به تومان؟ فقط عدد","cp":"جریمه چند امتیاز باشد؟"}
         await q.message.reply_text(prompts[a]);return states[a]
+    if a=="add":
+        return await preadd_start(update,c)
     if a=="publish":
         t=await trip(db,tid)
         if not x.enabled or x.capacity<=0:await q.message.reply_text("اول پیش‌رزرو را فعال و ظرفیت را تعیین کن.");return ConversationHandler.END
@@ -289,7 +294,12 @@ async def action(update,c):
         async with db.sessions() as s:
             rows=(await s.execute(select(User.full_name,Prebooking.status,Prebooking.price_snapshot,Prebooking.discount_snapshot).join(Prebooking,Prebooking.telegram_id==User.telegram_id).where(Prebooking.trip_id==tid).order_by(Prebooking.created_at))).all()
         lab={"prebooked":"🟡 پیش‌رزرو","confirmed":"🟢 قطعی","waitlist":"⏳ انتظار","cancelled":"⚪ لغو"}
-        await q.message.reply_text("\n".join(["👥 پیش‌رزروها",""]+[f"{lab.get(st,st)} | {n} | {money(p)} | تخفیف {money(d)}" for n,st,p,d in rows]) if rows else "هنوز کسی ثبت نشده.")
+        if not rows:
+            await q.message.reply_text("هنوز کسی ثبت نشده.");return ConversationHandler.END
+        async with db.sessions() as ss:
+            rr=(await ss.execute(select(User.telegram_id,User.full_name,Prebooking.status).join(Prebooking,Prebooking.telegram_id==User.telegram_id).where(Prebooking.trip_id==tid).order_by(Prebooking.created_at))).all()
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"{lab.get(st,st)} | {name}"[:60],callback_data=f"pview:person:{tid}:{uid}")] for uid,name,st in rr])
+        await q.message.reply_text("👥 پیش‌رزروها — برای تغییر وضعیت روی نام بزن:",reply_markup=kb)
     return ConversationHandler.END
 
 async def value(update,c):
@@ -316,8 +326,60 @@ async def mine(update,c):
     for r,t in rows:lines += [f"{lab.get(r.status,r.status)} — {t.title}",f"💳 مبلغ: {money(r.price_snapshot)}",f"🎁 تخفیف: {money(r.discount_snapshot)}",""]
     await update.message.reply_text("\n".join(lines))
 
+async def preadd_start(update,c):
+    q=update.callback_query
+    if not admin(q.from_user.id,c):return
+    await q.answer();tid=int(q.data.split(":")[2])
+    c.user_data["preadd_tid"]=tid;c.user_data["preadd_waiting"]=True
+    await q.message.reply_text("🔎 نام، شماره موبایل، KZH، BTC یا Telegram ID مسافر را وارد کن:")
+
+async def preadd_search(update,c):
+    if not admin(update.effective_user.id,c) or not c.user_data.get("preadd_waiting"):return
+    value=(update.message.text or "").strip();db=c.application.bot_data["db"];tid=int(c.user_data["preadd_tid"])
+    users=await db.search_users(value,limit=10)
+    if not users:
+        await update.message.reply_text("مسافری پیدا نشد. دوباره جستجو کن.");return
+    rows=[[InlineKeyboardButton(f"{u.full_name} | {u.phone}"[:60],callback_data=f"padd:pick:{tid}:{u.telegram_id}")] for u in users]
+    rows.append([InlineKeyboardButton("❌ لغو",callback_data=f"padd:cancel:{tid}")])
+    await update.message.reply_text("مسافر را انتخاب کن:",reply_markup=InlineKeyboardMarkup(rows))
+
+async def preadd_cb(update,c):
+    q=update.callback_query
+    if not admin(q.from_user.id,c):return
+    await q.answer();z=q.data.split(":");act=z[1];tid=int(z[2]);db=c.application.bot_data["db"]
+    if act=="cancel":
+        c.user_data.pop("preadd_waiting",None);c.user_data.pop("preadd_tid",None);await q.edit_message_text("لغو شد.");return
+    uid=int(z[3])
+    if act=="pick":
+        u=await db.get_user(uid)
+        await q.edit_message_text(f"👤 {u.full_name}\nوضعیت موردنظر را انتخاب کن:",reply_markup=InlineKeyboardMarkup([
+          [InlineKeyboardButton("🟡 پیش‌رزرو",callback_data=f"padd:set:{tid}:{uid}:prebooked"),
+           InlineKeyboardButton("🟢 رزرو قطعی",callback_data=f"padd:set:{tid}:{uid}:confirmed")],
+          [InlineKeyboardButton("⏳ لیست انتظار",callback_data=f"padd:set:{tid}:{uid}:waitlist"),
+           InlineKeyboardButton("⚪ لغو",callback_data=f"padd:set:{tid}:{uid}:cancelled")]]));return
+    if act=="set":
+        status=z[4];x=await cfg(db,tid,True)
+        async with db.sessions() as ss:
+            r=(await ss.execute(select(Prebooking).where(Prebooking.trip_id==tid,Prebooking.telegram_id==uid))).scalar_one_or_none()
+            price=max(0,x.regular_price-x.early_discount)
+            if r:r.status=status;r.updated_at=datetime.now(timezone.utc)
+            else:ss.add(Prebooking(trip_id=tid,telegram_id=uid,status=status,price_snapshot=price,discount_snapshot=x.early_discount))
+            await ss.commit()
+        c.user_data.pop("preadd_waiting",None);c.user_data.pop("preadd_tid",None)
+        u=await db.get_user(uid);labels={"prebooked":"پیش‌رزرو","confirmed":"رزرو قطعی","waitlist":"لیست انتظار","cancelled":"لغو"}
+        await q.edit_message_text(f"✅ {u.full_name} با وضعیت «{labels[status]}» ثبت شد.")
+        await refresh(c,tid)
+
+async def preperson_cb(update,c):
+    q=update.callback_query
+    if not admin(q.from_user.id,c):return
+    await q.answer();z=q.data.split(":");tid=int(z[2]);uid=int(z[3]);db=c.application.bot_data["db"];u=await db.get_user(uid)
+    await q.message.reply_text(f"👤 {u.full_name}\nوضعیت جدید:",reply_markup=InlineKeyboardMarkup([
+      [InlineKeyboardButton("🟡 پیش‌رزرو",callback_data=f"padd:set:{tid}:{uid}:prebooked"),InlineKeyboardButton("🟢 قطعی",callback_data=f"padd:set:{tid}:{uid}:confirmed")],
+      [InlineKeyboardButton("⏳ انتظار",callback_data=f"padd:set:{tid}:{uid}:waitlist"),InlineKeyboardButton("⚪ لغو",callback_data=f"padd:set:{tid}:{uid}:cancelled")]]))
+
 def flow():
-    return ConversationHandler(entry_points=[CallbackQueryHandler(panel,pattern=r"^pa:view:\d+$"),CallbackQueryHandler(action,pattern=r"^pa:(toggle|wait|names|publish|list|cap|price|disc|deadline|execute|ch|cp):\d+$")],
+    return ConversationHandler(entry_points=[CallbackQueryHandler(panel,pattern=r"^pa:view:\d+$"),CallbackQueryHandler(action,pattern=r"^pa:(toggle|wait|names|publish|list|cap|price|disc|deadline|execute|penaltydate|cp|add|pick|status):\d+(?::[^:]+)?$")],
       states={CAP:[MessageHandler(filters.TEXT&~filters.COMMAND,value)],PRICE:[MessageHandler(filters.TEXT&~filters.COMMAND,value)],DISC:[MessageHandler(filters.TEXT&~filters.COMMAND,value)],CANCEL_HOURS:[MessageHandler(filters.TEXT&~filters.COMMAND,value)],CANCEL_POINTS:[MessageHandler(filters.TEXT&~filters.COMMAND,value)]},fallbacks=[],allow_reentry=True)
 
 async def loop(app):
@@ -331,8 +393,11 @@ async def loop(app):
         await asyncio.sleep(3600)
 
 async def initialize_prebooking(app):
-    async with app.bot_data["db"].engine.begin() as conn:await conn.run_sync(Base.metadata.create_all)
+    from sqlalchemy import text as sql_text
+    async with app.bot_data["db"].engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(sql_text("ALTER TABLE prebooking_settings ADD COLUMN IF NOT EXISTS cancel_from_at TIMESTAMPTZ"))
     asyncio.create_task(loop(app))
 
 def handlers():
-    return [flow(),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine)]
+    return [flow(),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine)]
