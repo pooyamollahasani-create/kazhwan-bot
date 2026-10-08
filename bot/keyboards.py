@@ -61,7 +61,7 @@ def private_start_keyboard(bot_username: str) -> InlineKeyboardMarkup:
 def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            ["🗓 برنامه‌های آینده", "📝 ثبت‌نام‌های من"],
+            ["🗓 برنامه‌های آینده", "🎟 پیش‌رزروهای من"],
             ["👤 پروفایل من", "📜 تاریخچه فعالیت‌های من"],
             ["🎖 کارت عضویت", "📞 پشتیبانی"],
         ],
