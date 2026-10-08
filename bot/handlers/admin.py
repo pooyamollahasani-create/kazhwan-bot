@@ -11,6 +11,7 @@ from telegram.ext import (
 )
 
 from bot.utils.xlsx import build_xlsx
+from bot.display_helpers import jalali_date, referrer_name
 from sqlalchemy import select
 from bot.db import Trip
 
@@ -20,7 +21,6 @@ MANUAL_TRIP_TITLE, MANUAL_TRIP_TYPE, MANUAL_TRIP_START, MANUAL_TRIP_END, MANUAL_
 QUIET_START_INPUT, QUIET_END_INPUT = range(200, 202)
 MEMBER_SEARCH_INPUT = 300
 MANUAL_POINTS_AMOUNT, MANUAL_POINTS_REASON = range(310, 312)
-OFFLINE_POINTS_AMOUNT, OFFLINE_POINTS_REASON = range(320, 322)
 
 
 STATUS_LABELS = {
@@ -80,7 +80,7 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📥 خروجی کامل", callback_data="admin:exportall"),
         ],
         [
-            InlineKeyboardButton("👤 مسافران بدون تلگرام", callback_data="admin:guests"),
+            InlineKeyboardButton("📝 مسافران موقت", callback_data="admin:guests"),
             InlineKeyboardButton("🔎 جستجوی اعضا", callback_data="admin:membersearch"),
         ],
     ])
@@ -107,7 +107,6 @@ def _trip_actions_keyboard(trip) -> InlineKeyboardMarkup:
             InlineKeyboardButton("👥 مسافران", callback_data=f"tripadmin:participants:{trip.id}:0"),
             InlineKeyboardButton("📥 Excel", callback_data=f"tripadmin:export:{trip.id}"),
         ],
-        [InlineKeyboardButton("💬 نظرسنجی سفر", callback_data=f"tripfeedback:view:{trip.id}")],
     ]
     if trip.status == "open":
         rows.append([InlineKeyboardButton("🔒 بستن ثبت", callback_data=f"tripadmin:status:{trip.id}:closed")])
@@ -130,7 +129,7 @@ def _participant_list_keyboard(trip_id: int, people, page: int, per_page: int = 
     buttons = []
     for item in page_rows:
         status = STATUS_LABELS.get(item["status"], item["status"])
-        prefix = "👤" if item["kind"] == "user" else "⚪"
+        prefix = "👤" if item["kind"] == "user" else "📝"
         callback = (
             f"tripadmin:person:{trip_id}:{item['telegram_id']}:{page}"
             if item["kind"] == "user"
@@ -162,7 +161,6 @@ def _guest_actions_keyboard(trip_id: int, guest_id: int, page: int) -> InlineKey
         [InlineKeyboardButton("✅ شرکت کرده", callback_data=f"tripadmin:setguest:{trip_id}:{guest_id}:attended:{page}")],
         [InlineKeyboardButton("❌ انصراف", callback_data=f"tripadmin:setguest:{trip_id}:{guest_id}:cancelled:{page}")],
         [InlineKeyboardButton("🟡 اعلام حضور", callback_data=f"tripadmin:setguest:{trip_id}:{guest_id}:declared:{page}")],
-        [InlineKeyboardButton("👤 پروفایل مسافر", callback_data=f"offlineprofile:view:{guest_id}")],
         [InlineKeyboardButton("⬅️ لیست مسافران", callback_data=f"tripadmin:participants:{trip_id}:{page}")],
     ])
 
@@ -270,7 +268,7 @@ async def _stats_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"معرفی‌های موفق: {total_referrals}\n"
         f"مجموع امتیاز اعضا: {total_points}\n"
         f"تعداد سفرهای ثبت‌شده: {len(trips)}\n"
-        f"مسافران دائمی بدون اتصال تلگرام: {len(guests)}"
+        f"مسافران موقت بدون پروفایل: {len(guests)}"
     )
 
 
@@ -365,7 +363,7 @@ async def member_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     await query.message.reply_text(
         "🔎 جستجوی اعضا\n\n"
-        "نام و نام خانوادگی، شماره تماس، @آیدی تلگرام، کد KZH/BTC/KTR یا Telegram ID را بفرستید.\n\n"
+        "نام و نام خانوادگی، شماره تماس، @آیدی تلگرام، کد KZH/BTC یا Telegram ID را بفرستید.\n\n"
         "مثال:\nپویا ملاحسنی\n0912...\n@username\nKZH-000012"
     )
     return MEMBER_SEARCH_INPUT
@@ -381,10 +379,9 @@ async def member_search_receive(update: Update, context: ContextTypes.DEFAULT_TY
 
     db = context.application.bot_data["db"]
     users = await db.search_users(value, limit=15)
-    offline = await db.search_offline_travelers(value, limit=15)
-    if not users and not offline:
+    if not users:
         await update.effective_message.reply_text(
-            f"❌ برای «{value}» مسافری پیدا نشد.",
+            f"❌ برای «{value}» عضوی پیدا نشد.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔎 جستجوی دوباره", callback_data="admin:membersearch")],
                 [InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")],
@@ -395,17 +392,12 @@ async def member_search_receive(update: Update, context: ContextTypes.DEFAULT_TY
     rows = []
     for user in users:
         username = f"@{user.telegram_username}" if user.telegram_username else user.phone
-        label = f"📱 {user.full_name} | {username}"
+        label = f"👤 {user.full_name} | {username}"
         rows.append([InlineKeyboardButton(label[:62], callback_data=f"memberprofile:view:{user.telegram_id}")])
-    for guest in offline:
-        label = f"⚪ {guest.full_name} | {guest.phone or 'بدون شماره'} | {guest.traveler_code or ''}"
-        rows.append([InlineKeyboardButton(label[:62], callback_data=f"offlineprofile:view:{guest.id}")])
-    rows = rows[:20]
     rows.append([InlineKeyboardButton("🔎 جستجوی جدید", callback_data="admin:membersearch")])
     rows.append([InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")])
     await update.effective_message.reply_text(
-        f"🔎 {len(users) + len(offline)} نتیجه برای «{value}» پیدا شد:\n\n"
-        "📱 تلگرام متصل | ⚪ تلگرام متصل نشده",
+        f"🔎 {len(users)} نتیجه برای «{value}» پیدا شد:\n\nعضو موردنظر را انتخاب کنید:",
         reply_markup=InlineKeyboardMarkup(rows),
     )
     return ConversationHandler.END
@@ -426,7 +418,7 @@ def _fmt_dt(value) -> str:
     if not value:
         return "-"
     try:
-        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        return jalali_date(value)
     except Exception:
         return str(value)
 
@@ -494,7 +486,7 @@ async def member_profile_callback(update: Update, context: ContextTypes.DEFAULT_
         f"🆔 KZH: {user.member_code or '-'}",
         f"⛰ عضو BTC: {'✅ بله' if btc_active else '❌ خیر'}",
         f"🏷 BTC Code: {btc_code}",
-        f"🔗 کد معرف: {user.referral_code or '-'}",
+        f"👥 نام معرف: {await referrer_name(context.application.bot_data["db"],user)}",
         "",
         f"Telegram: {username}",
         f"Telegram ID: {user.telegram_id}",
@@ -708,7 +700,7 @@ async def topreferrals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _member_export_rows(db, users):
     headers = [
         "نام و نام خانوادگی", "شماره تماس", "شهر", "Username", "Telegram ID",
-        "کد عضویت کژوان", "کد عضویت BTC", "عضو BTC", "کد معرف کژوان", "معرف Telegram ID",
+        "کد عضویت کژوان", "کد عضویت BTC", "عضو BTC", "نام معرف", "معرف",
         "تعداد معرفی موفق", "امتیاز کل", "نحوه آشنایی", "تاریخ ثبت",
         "آخرین فعالیت", "وضعیت", "تاریخچه سفرهای داخلی", "تاریخچه سفرهای خارجی",
     ]
@@ -718,7 +710,7 @@ async def _member_export_rows(db, users):
         target = "international" if trip.trip_type == "international" else "domestic"
         type_label = TRIP_TYPE_LABELS.get(trip.trip_type, trip.trip_type)
         text = (
-            f"{trip.title} [{type_label}] ({trip.start_date_text} تا {trip.end_date_text}) - "
+            f"{trip.title} [{type_label}] ({jalali_date(trip.start_date_text)} تا {jalali_date(trip.end_date_text)}) - "
             f"{STATUS_LABELS.get(participant.status, participant.status)} - {participant.awarded_points or 0} امتیاز"
         )
         bucket[target].append(text)
@@ -729,10 +721,10 @@ async def _member_export_rows(db, users):
         rows.append([
             user.full_name, user.phone, user.city,
             f"@{user.telegram_username}" if user.telegram_username else "", user.telegram_id,
-            user.member_code or "", btc.btc_code if btc else "", "بله" if btc and btc.status == "active" else "خیر", user.referral_code or "",
-            user.referred_by_telegram_id or "", user.referral_count, user.points, user.discovery_source,
-            user.created_at.isoformat() if user.created_at else "",
-            user.last_activity_at.isoformat() if user.last_activity_at else "", user.status,
+            user.member_code or "", btc.btc_code if btc else "", "بله" if btc and btc.status == "active" else "خیر", await referrer_name(db,user),
+            await referrer_name(db,user), user.referral_count, user.points, user.discovery_source,
+            jalali_date(user.created_at),
+            jalali_date(user.last_activity_at), user.status,
             " | ".join(history["domestic"]), " | ".join(history["international"]),
         ])
     return headers, rows
@@ -760,7 +752,7 @@ async def exportinactive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     now = datetime.now(timezone.utc)
     headers = ["نام", "Username", "Telegram ID", "روزهای بی‌فعالیتی", "آخرین فعالیت"]
     rows = [[m.display_name, f"@{m.telegram_username}" if m.telegram_username else "", m.telegram_id,
-             (now-m.last_activity_at).days, m.last_activity_at.isoformat()] for m in items]
+             (now-m.last_activity_at).days, jalali_date(m.last_activity_at)] for m in items]
     await _send_xlsx(update, headers, rows, "kazhwan_inactive.xlsx", "Inactive")
 
 
@@ -768,8 +760,8 @@ async def exportreferrals(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not is_admin(update.effective_user.id, context):
         return
     users = await context.application.bot_data["db"].list_top_referrers(limit=5000)
-    headers = ["نام", "شماره", "کد معرف", "تعداد معرفی موفق", "امتیاز", "Telegram ID"]
-    rows = [[u.full_name, u.phone, u.referral_code or "", u.referral_count, u.points, u.telegram_id] for u in users]
+    headers = ["نام", "شماره", "نام معرف", "تعداد معرفی موفق", "امتیاز", "Telegram ID"]
+    rows = [[u.full_name, u.phone, await referrer_name(context.application.bot_data["db"],u), u.referral_count, u.points, u.telegram_id] for u in users]
     await _send_xlsx(update, headers, rows, "kazhwan_referrals.xlsx", "Referrals")
 
 
@@ -792,7 +784,7 @@ def _trip_export_data(trip, people):
                 user.city if user else "", f"@{user.telegram_username}" if user and user.telegram_username else "",
                 participant.telegram_id, user.member_code if user else "",
                 STATUS_LABELS.get(participant.status, participant.status),
-                participant.declared_at.isoformat() if participant.declared_at else "", trip.title,
+                jalali_date(participant.declared_at), trip.title,
                 TRIP_TYPE_LABELS.get(trip.trip_type, trip.trip_type), trip.points_value,
                 participant.awarded_points or 0, trip.trip_code,
             ])
@@ -801,7 +793,7 @@ def _trip_export_data(trip, people):
             rows.append([
                 "مسافر موقت", guest.full_name, guest.phone or "", "", "", "", "",
                 STATUS_LABELS.get(participant.status, participant.status),
-                participant.declared_at.isoformat() if participant.declared_at else "", trip.title,
+                jalali_date(participant.declared_at), trip.title,
                 TRIP_TYPE_LABELS.get(trip.trip_type, trip.trip_type), trip.points_value,
                 participant.pending_points or 0, trip.trip_code,
             ])
@@ -964,8 +956,8 @@ async def manual_guest_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     else:
         await update.effective_message.reply_text(
-            "برای این شخص یک پروفایل دائمی مسافر کژوان ساخته می‌شود.\n"
-            "تلگرام برای ثبت مسافر الزامی نیست؛ بعداً همین پروفایل می‌تواند به تلگرام او متصل شود.\n\n"
+            "این شخص پروفایل قطعی کژوان ندارد؛ به‌عنوان «مسافر موقت» ثبت می‌شود.\n"
+            "بعداً هنگام ثبت‌نام واقعی، سابقه با تأیید مدیر به پروفایل او متصل می‌شود.\n\n"
             "وضعیت سفر را انتخاب کنید:",
             reply_markup=_manual_status_keyboard(),
         )
@@ -1000,119 +992,15 @@ async def manual_guest_status(update: Update, context: ContextTypes.DEFAULT_TYPE
             query.from_user.id,
         )
         participant = await db.register_guest_trip_participant(trip_id, guest.id, status=status)
-        guest = await db.get_guest(guest.id)
         text = (
-            f"✅ {guest.full_name} به‌عنوان مسافر دائمی کژوان ثبت شد.\n"
-            f"🆔 {guest.traveler_code}\n"
-            f"⚪ تلگرام متصل نشده / فاقد اکانت تلگرام\n"
-            f"وضعیت: {STATUS_LABELS.get(status, status)}\n"
-            f"⭐ امتیاز کل: {guest.points}"
+            f"✅ {guest.full_name} به‌صورت مسافر موقت ثبت شد.\n"
+            f"وضعیت: {STATUS_LABELS.get(status, status)}"
         )
-        if participant.points_awarded:
-            text += f"\n⭐ امتیاز این سفر: {participant.awarded_points}"
+        if participant.pending_points:
+            text += f"\n⭐ {participant.pending_points} امتیاز به‌صورت معوق نگه داشته شد."
     context.user_data.clear()
     await query.message.reply_text(text, reply_markup=_trip_actions_keyboard(trip))
     return ConversationHandler.END
-
-
-async def offline_profile_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not is_admin(query.from_user.id, context):
-        return
-    await query.answer()
-    action, guest_id = query.data.split(":")[1], int(query.data.split(":")[2])
-    db = context.application.bot_data["db"]
-    guest = await db.get_guest(guest_id)
-    if not guest or guest.linked_telegram_id is not None:
-        await query.message.reply_text("این پروفایل پیدا نشد یا قبلاً به تلگرام متصل شده است.")
-        return
-    history = await db.get_offline_traveler_manual_points_history(guest_id, limit=20)
-    trip_rows = []
-    for trip in await db.list_trips(limit=5000):
-        for participant, g in await db.list_guest_trip_participants(trip.id):
-            if g.id == guest_id:
-                trip_rows.append((participant, trip))
-    if action == "history":
-        lines = [f"🧳 تاریخچه سفرهای {guest.full_name}", ""]
-        if not trip_rows: lines.append("هنوز سفری ثبت نشده است.")
-        for p, trip in trip_rows[:30]:
-            lines.append(f"• {trip.title} | {STATUS_LABELS.get(p.status, p.status)} | {p.awarded_points or 0} امتیاز")
-        await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ پروفایل", callback_data=f"offlineprofile:view:{guest_id}")]]))
-        return
-    if action == "points":
-        lines = [f"📜 امتیازهای دستی {guest.full_name}", ""]
-        if not history: lines.append("هنوز امتیاز دستی ثبت نشده است.")
-        for item in history:
-            details = (item.details or "").split(" | Admin Telegram ID:", 1)[0]
-            lines.append(f"• {details} | {_fmt_dt(item.created_at)}")
-        await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ پروفایل", callback_data=f"offlineprofile:view:{guest_id}")]]))
-        return
-    attended = sum(1 for p, _ in trip_rows if p.status == "attended")
-    declared = sum(1 for p, _ in trip_rows if p.status == "declared")
-    cancelled = sum(1 for p, _ in trip_rows if p.status == "cancelled")
-    lines = ["👤 پروفایل مسافر کژوان", "", f"نام: {guest.full_name}", f"📱 موبایل: {guest.phone or '-'}",
-             f"🆔 کد مسافر: {guest.traveler_code or '-'}", "⚪ تلگرام متصل نشده / فاقد اکانت تلگرام",
-             f"⭐ امتیاز کل: {guest.points}"]
-    if history: lines.append(f"📝 امتیاز دستی اخیر: {history[0].details.split(' | Admin Telegram ID:', 1)[0]}")
-    lines += ["", f"🧳 سفرها: {len(trip_rows)} | شرکت‌کرده {attended} | اعلام حضور {declared} | انصراف {cancelled}"]
-    await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ افزودن امتیاز", callback_data=f"offlinepoints:add:{guest_id}"),
-         InlineKeyboardButton("➖ کسر امتیاز", callback_data=f"offlinepoints:subtract:{guest_id}")],
-        [InlineKeyboardButton("📜 تاریخچه امتیاز دستی", callback_data=f"offlineprofile:points:{guest_id}")],
-        [InlineKeyboardButton("🧳 تاریخچه سفرها", callback_data=f"offlineprofile:history:{guest_id}")],
-        [InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")],
-    ]))
-
-
-async def offline_points_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if not query or not is_admin(query.from_user.id, context): return ConversationHandler.END
-    await query.answer()
-    _, action, raw_id = query.data.split(":")
-    guest = await context.application.bot_data["db"].get_guest(int(raw_id))
-    if not guest: return ConversationHandler.END
-    context.user_data["offline_points_target"] = guest.id
-    context.user_data["offline_points_mode"] = "subtract" if action == "subtract" else "add"
-    await query.message.reply_text(f"⭐ {'کسر' if action == 'subtract' else 'افزودن'} امتیاز برای {guest.full_name}\nامتیاز فعلی: {guest.points}\n\nمقدار مثبت را وارد کنید:")
-    return OFFLINE_POINTS_AMOUNT
-
-
-async def offline_points_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    value = (update.effective_message.text or "").strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
-    try: points = int(value)
-    except ValueError:
-        await update.effective_message.reply_text("فقط عدد صحیح مثبت وارد کنید."); return OFFLINE_POINTS_AMOUNT
-    if points <= 0 or points > 100000:
-        await update.effective_message.reply_text("عدد باید بین 1 تا 100000 باشد."); return OFFLINE_POINTS_AMOUNT
-    context.user_data["offline_points_amount"] = -points if context.user_data.get("offline_points_mode") == "subtract" else points
-    await update.effective_message.reply_text("📝 دلیل این تغییر امتیاز را بنویسید:")
-    return OFFLINE_POINTS_REASON
-
-
-async def offline_points_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reason = (update.effective_message.text or "").strip()
-    if len(reason) < 2:
-        await update.effective_message.reply_text("لطفاً دلیل را وارد کنید."); return OFFLINE_POINTS_REASON
-    guest_id, points = int(context.user_data["offline_points_target"]), int(context.user_data["offline_points_amount"])
-    result = await context.application.bot_data["db"].add_offline_traveler_manual_points(guest_id, points, reason, update.effective_user.id)
-    if result and result.get("error") == "negative_total":
-        await update.effective_message.reply_text(f"❌ امتیاز کل نمی‌تواند منفی شود. امتیاز فعلی: {result['current_points']}"); return ConversationHandler.END
-    if not result:
-        await update.effective_message.reply_text("پروفایل مسافر پیدا نشد."); return ConversationHandler.END
-    sign = "+" if result["points_added"] > 0 else ""
-    await update.effective_message.reply_text(
-        f"✅ امتیاز ثبت شد.\n👤 {result['full_name']}\n🔢 تغییر: {sign}{result['points_added']}\n⭐ امتیاز کل: {result['total_points']}\n📝 دلیل: {reason}",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("👤 پروفایل", callback_data=f"offlineprofile:view:{guest_id}")]]))
-    for key in ("offline_points_target", "offline_points_amount", "offline_points_mode"): context.user_data.pop(key, None)
-    return ConversationHandler.END
-
-
-def build_offline_points_handler() -> ConversationHandler:
-    return ConversationHandler(
-        entry_points=[CallbackQueryHandler(offline_points_start, pattern=r"^offlinepoints:(add|subtract):\d+$")],
-        states={OFFLINE_POINTS_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, offline_points_amount)],
-                OFFLINE_POINTS_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, offline_points_reason)]},
-        fallbacks=[CommandHandler("cancel", admin_flow_cancel)], allow_reentry=True)
 
 
 async def admin_flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1290,17 +1178,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif action == "guests":
         guests = await context.application.bot_data["db"].list_unlinked_guests(limit=50)
         if not guests:
-            await query.message.reply_text("فعلاً مسافر بدون اتصال تلگرام نداریم.")
+            await query.message.reply_text("✅ مسافر موقتِ بدون پروفایل نداریم.")
         else:
-            rows = []
+            lines = ["📝 مسافران موقت بدون پروفایل", ""]
             for guest in guests:
-                label = f"👤 {guest.full_name} | {guest.phone or 'بدون شماره'} | ⭐ {guest.points}"
-                rows.append([InlineKeyboardButton(label[:62], callback_data=f"offlineprofile:view:{guest.id}")])
-            rows.append([InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")])
-            await query.message.reply_text(
-                "👤 مسافران دائمی بدون اتصال تلگرام\n\nروی نام مسافر بزنید:",
-                reply_markup=InlineKeyboardMarkup(rows),
-            )
+                lines.append(f"• {guest.full_name} — {guest.phone or 'بدون شماره'}")
+            lines.append("\nبعد از ثبت‌نام واقعی، ربات تطبیق احتمالی را برای تأیید به مدیر پیشنهاد می‌دهد.")
+            await query.message.reply_text("\n".join(lines))
     elif action == "trips":
         trips = await _list_trips_compat(context.application.bot_data["db"], limit=30)
         await query.message.reply_text(
@@ -1346,7 +1230,7 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         rows.append([InlineKeyboardButton("⬅️ آرشیو", callback_data="tripadmin:archived")])
         merged = f"\n🔀 ادغام‌شده در سفر ID {trip.merged_into_trip_id}" if trip.merged_into_trip_id else ""
         await query.message.reply_text(
-            f"🗃 {trip.title}\n🆔 {trip.trip_code}\n📅 {trip.start_date_text} تا {trip.end_date_text}{merged}",
+            f"🗃 {trip.title}\n🆔 {trip.trip_code}\n📅 {jalali_date(trip.start_date_text)} تا {jalali_date(trip.end_date_text)}{merged}",
             reply_markup=InlineKeyboardMarkup(rows),
         )
     elif action == "archive":
@@ -1438,11 +1322,11 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         guests = sum(1 for item in people if item["kind"] == "guest")
         group_text = "متصل به گروه تلگرام" if trip.telegram_chat_id else "ثبت دستی — بدون گروه"
         await query.message.reply_text(
-            f"🧳 {trip.title}\n🆔 {trip.trip_code}\n📅 {trip.start_date_text} تا {trip.end_date_text}\n"
+            f"🧳 {trip.title}\n🆔 {trip.trip_code}\n📅 {jalali_date(trip.start_date_text)} تا {jalali_date(trip.end_date_text)}\n"
             f"نوع: {TRIP_TYPE_LABELS.get(trip.trip_type, trip.trip_type)}\n⭐ امتیاز: {trip.points_value}\n"
             f"وضعیت: {TRIP_STATUS_LABELS.get(trip.status, trip.status)}\n📌 {group_text}\n\n"
             f"🟡 اعلام حضور: {declared}\n🟢 شرکت کرده: {attended}\n⚪ انصراف: {cancelled}\n"
-            f"⚪ بدون اتصال تلگرام: {guests}",
+            f"📝 مسافر موقت: {guests}",
             reply_markup=_trip_actions_keyboard(trip),
         )
     elif action == "participants":
@@ -1453,7 +1337,7 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_text("هنوز مسافری برای این سفر ثبت نشده است.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ اطلاعات سفر", callback_data=f"tripadmin:view:{trip_id}")]]))
             return
         await query.message.reply_text(
-            f"👥 مسافران — {trip.title if trip else trip_id}\n👤 تلگرام متصل | ⚪ تلگرام متصل نشده\nروی نام هر مسافر بزنید:",
+            f"👥 مسافران — {trip.title if trip else trip_id}\n👤 پروفایل کژوان | 📝 مسافر موقت\nروی نام هر مسافر بزنید:",
             reply_markup=_participant_list_keyboard(trip_id, people, page),
         )
     elif action == "person":
@@ -1501,10 +1385,9 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         participant, _ = found
         await query.message.reply_text(
-            f"👤 {guest.full_name}\n📱 {guest.phone or '-'}\n🆔 {guest.traveler_code or '-'}\n"
-            f"⚪ تلگرام متصل نشده / فاقد اکانت\n"
+            f"📝 مسافر موقت\n👤 {guest.full_name}\n📱 {guest.phone or '-'}\n"
             f"وضعیت: {STATUS_LABELS.get(participant.status, participant.status)}\n"
-            f"⭐ امتیاز این سفر: {participant.awarded_points or 0}\n🏆 امتیاز کل: {guest.points}",
+            f"⭐ امتیاز معوق: {participant.pending_points or 0}",
             reply_markup=_guest_actions_keyboard(trip_id, guest_id, page),
         )
     elif action == "setguest":
@@ -1514,9 +1397,9 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not participant or not guest:
             await query.message.reply_text("مسافر موقت پیدا نشد.")
             return
-        extra = f"\n⭐ امتیاز این سفر: {participant.awarded_points}" if participant.points_awarded else ""
+        extra = f"\n⭐ امتیاز معوق: {participant.pending_points}" if participant.pending_points else ""
         await query.message.reply_text(
-            f"✅ وضعیت {guest.full_name} به «{STATUS_LABELS.get(status, status)}» تغییر کرد.{extra}\n🏆 امتیاز کل: {guest.points}",
+            f"✅ وضعیت {guest.full_name} به «{STATUS_LABELS.get(status, status)}» تغییر کرد.{extra}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ لیست مسافران", callback_data=f"tripadmin:participants:{trip_id}:{page}")]]),
         )
     elif action == "status":
@@ -1581,7 +1464,6 @@ def admin_handlers():
         build_quiet_settings_handler(),
         build_member_search_handler(),
         build_manual_points_handler(),
-        build_offline_points_handler(),
         CallbackQueryHandler(manual_points_history, pattern=r"^memberpoints:history:\d+$"),
         CommandHandler("admin", admin_panel), CommandHandler("chatid", chatid), CommandHandler("stats", stats),
         CommandHandler("members", members), CommandHandler("registered", registered), CommandHandler("unregistered", unregistered),
@@ -1591,7 +1473,6 @@ def admin_handlers():
         CommandHandler("exportreferrals", exportreferrals), CommandHandler("exportall", exportall),
         CallbackQueryHandler(admin_callback, pattern=r"^admin:"),
         CallbackQueryHandler(member_profile_callback, pattern=r"^memberprofile:(view|history):\d+$"),
-        CallbackQueryHandler(offline_profile_callback, pattern=r"^offlineprofile:(view|history|points):\d+$"),
         CallbackQueryHandler(guest_match_callback, pattern=r"^guestmatch:(link|skip):\d+:\d+$"),
         CallbackQueryHandler(trip_admin_callback, pattern=r"^tripadmin:"),
     ]

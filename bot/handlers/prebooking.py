@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from bot.db import Base, Activity, Trip, User, BtcMembership, TripParticipant
+from bot.display_helpers import jalali_date
 
 log=logging.getLogger(__name__)
 IR=ZoneInfo("Asia/Tehran")
@@ -710,8 +711,8 @@ async def initialize_prebooking(app):
 
 async def profile_prebookings(update,c):
     q=update.callback_query
-    await q.answer()
-    db=c.application.bot_data["db"];uid=q.from_user.id
+    if q:await q.answer()
+    db=c.application.bot_data["db"];uid=update.effective_user.id
     async with db.sessions() as ss:
         rows=(await ss.execute(select(Prebooking,Trip).join(Trip,Trip.id==Prebooking.trip_id).where(
             Prebooking.telegram_id==uid,Prebooking.status.in_(["prebooked","confirmed","waitlist"])
@@ -719,7 +720,7 @@ async def profile_prebookings(update,c):
         receipts=(await ss.execute(select(PrebookingReceipt).where(
             PrebookingReceipt.telegram_id==uid).order_by(PrebookingReceipt.submitted_at.desc()))).scalars().all()
     if not rows:
-        await q.message.reply_text("🎟 پیش‌رزروهای من\n\nدر حال حاضر پیش‌رزرو فعالی ندارید.");return
+        await update.effective_message.reply_text("🎟 پیش‌رزروهای من\n\nدر حال حاضر پیش‌رزرو فعالی ندارید.");return
     latest={}
     for rr in receipts:
         if rr.trip_id not in latest:latest[rr.trip_id]=rr
@@ -734,7 +735,7 @@ async def profile_prebookings(update,c):
             rows_kb.append([InlineKeyboardButton(f"💳 پرداخت و بررسی ثبت‌نام | {pay_state}"[:60],callback_data=f"preprofile:payment:{t.id}")])
         elif pb.status=="confirmed":
             rows_kb.append([InlineKeyboardButton("✅ مشاهده تأیید رزرو",callback_data=f"preprofile:payment:{t.id}")])
-    await q.message.reply_text("🎟 پیش‌رزروهای من\n\nسفر موردنظر را انتخاب کنید:",reply_markup=InlineKeyboardMarkup(rows_kb))
+    await update.effective_message.reply_text("🎟 پیش‌رزروهای من\n\nسفر موردنظر را انتخاب کنید:",reply_markup=InlineKeyboardMarkup(rows_kb))
 
 async def profile_prebooking_cb(update,c):
     q=update.callback_query;await q.answer()
@@ -775,4 +776,4 @@ async def profile_prebooking_cb(update,c):
         parse_mode="HTML")
 
 def handlers():
-    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(receipt_review,pattern=r"^receipt:(approve|reject):\d+$"),CallbackQueryHandler(receipt_trip_pick,pattern=r"^receipttrip:\d+$"),CallbackQueryHandler(cancel_confirm,pattern=r"^preconfirm:(yes|no):\d+$"),CallbackQueryHandler(export_confirmed,pattern=r"^pexport:confirmed:\d+$"),CallbackQueryHandler(profile_prebookings,pattern=r"^preprofile:open$"),CallbackQueryHandler(profile_prebooking_cb,pattern=r"^preprofile:(view|payment):\d+$"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE,receipt_photo),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search)]
+    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(receipt_review,pattern=r"^receipt:(approve|reject):\d+$"),CallbackQueryHandler(receipt_trip_pick,pattern=r"^receipttrip:\d+$"),CallbackQueryHandler(cancel_confirm,pattern=r"^preconfirm:(yes|no):\d+$"),CallbackQueryHandler(export_confirmed,pattern=r"^pexport:confirmed:\d+$"),CallbackQueryHandler(profile_prebookings,pattern=r"^preprofile:open$"),CallbackQueryHandler(profile_prebooking_cb,pattern=r"^preprofile:(view|payment):\d+$"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^🎟 پیش‌رزروهای من$"),profile_prebookings),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE,receipt_photo),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search)]

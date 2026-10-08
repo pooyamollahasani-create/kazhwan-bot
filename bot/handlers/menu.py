@@ -2,6 +2,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
 from telegram.ext import CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 from bot.keyboards import discovery_keyboard, main_menu
+from bot.display_helpers import jalali_date, referrer_name
 from bot.profile_extra import get_neighborhood, save_neighborhood, update_basic_profile, update_phone
 
 DOMESTIC_TOURS_URL = "https://kazhwan.com/tours/"
@@ -12,7 +13,6 @@ EDIT_VALUE, EDIT_PHONE, EDIT_SOURCE, EDIT_SOURCE_OTHER = range(4)
 
 def _profile_actions_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎟 پیش‌رزروهای من", callback_data="preprofile:open")],
         [InlineKeyboardButton("✏️ ویرایش پروفایل", callback_data="profileedit:open")]
     ])
 
@@ -36,7 +36,8 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     btc = await db.get_btc_membership(update.effective_user.id)
     neighborhood = await get_neighborhood(db, update.effective_user.id)
-    joined = user.created_at.strftime("%Y/%m/%d") if user.created_at else "-"
+    joined = jalali_date(user.created_at)
+    referrer = await referrer_name(db,user)
     await update.message.reply_text(
         "👤 پروفایل من\n\n"
         f"نام: {user.full_name}\n"
@@ -46,7 +47,7 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📅 تاریخ عضویت: {joined}\n"
         f"کد عضویت کژوان: {user.member_code}\n"
         f"کد عضویت BTC: {btc.btc_code if btc else 'عضو BTC نیستید'}\n"
-        f"کد معرف کژوان: {user.referral_code or '-'}\n"
+        f"نام معرف: {referrer}\n"
         f"تعداد معرفی موفق: {user.referral_count}\n"
         f"امتیاز: {user.points}\n"
         f"وضعیت: {user.status}",
@@ -173,18 +174,18 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             for participant, trip in domestic:
                 subtype = "یک‌روزه" if getattr(trip,"trip_type","domestic_multi") == "domestic_day" else "چندروزه"
                 points = participant.awarded_points if getattr(participant,"points_awarded",False) else 0
-                lines.append(f"• {trip.title} ({subtype}) — {trip.start_date_text} تا {trip.end_date_text} — {labels.get(participant.status, participant.status)} — {points} امتیاز")
+                lines.append(f"• {trip.title} ({subtype}) — {jalali_date(trip.start_date_text)} تا {jalali_date(trip.end_date_text)} — {labels.get(participant.status, participant.status)} — {points} امتیاز")
             lines.append("")
         if international:
             lines.append("🌍 سفرهای خارجی")
             for participant, trip in international:
                 points = participant.awarded_points if getattr(participant,"points_awarded",False) else 0
-                lines.append(f"• {trip.title} — {trip.start_date_text} تا {trip.end_date_text} — {labels.get(participant.status, participant.status)} — {points} امتیاز")
+                lines.append(f"• {trip.title} — {jalali_date(trip.start_date_text)} تا {jalali_date(trip.end_date_text)} — {labels.get(participant.status, participant.status)} — {points} امتیاز")
             lines.append("")
     if activities:
         lines.append("🌿 سایر فعالیت‌ها")
         for item in activities:
-            lines.append(f"• {item.created_at.strftime('%Y/%m/%d')} — {item.title}")
+            lines.append(f"• {jalali_date(item.created_at)} — {item.title}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -195,12 +196,13 @@ async def card(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("ابتدا /start را بزنید.")
         return
     btc = await db.get_btc_membership(update.effective_user.id)
+    referrer = await referrer_name(db,user)
     await update.message.reply_text(
         "🎖 کارت عضویت کژوان\n\n"
         f"نام: {user.full_name}\n"
         f"کد کژوان: {user.member_code}\n"
         f"کد BTC: {btc.btc_code if btc else '-'}\n"
-        f"کد معرف: {user.referral_code or '-'}\n"
+        f"نام معرف: {referrer}\n"
         f"شهر: {user.city}\n"
         f"سطح: تازه‌وارد\n"
         f"امتیاز: {user.points}"
@@ -248,5 +250,5 @@ def menu_handlers():
         MessageHandler(filters.Regex("^🎖 کارت عضویت$"), card),
         MessageHandler(filters.Regex("^📞 پشتیبانی$"), support),
         MessageHandler(filters.Regex("^🗓 برنامه‌های آینده$"), future_programs),
-        MessageHandler(filters.Regex("^📝 ثبت‌نام‌های من$"), placeholder),
+
     ]
