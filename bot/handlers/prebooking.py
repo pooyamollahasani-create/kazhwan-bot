@@ -601,7 +601,7 @@ async def preadd_start(update,c):
     await q.message.reply_text("🔎 نام، شماره موبایل، KZH، BTC یا Telegram ID مسافر را وارد کن:")
 
 async def preadd_search(update,c):
-    if not admin(update.effective_user.id,c) or not c.user_data.get("preadd_waiting"):return
+    if update.effective_chat.type != "private" or not admin(update.effective_user.id,c) or not c.user_data.get("preadd_waiting"):return
     value=(update.message.text or "").strip();db=c.application.bot_data["db"];tid=int(c.user_data["preadd_tid"])
     users=await db.search_users(value,limit=10)
     if not users:
@@ -776,4 +776,4 @@ async def profile_prebooking_cb(update,c):
         parse_mode="HTML")
 
 def handlers():
-    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(receipt_review,pattern=r"^receipt:(approve|reject):\d+$"),CallbackQueryHandler(receipt_trip_pick,pattern=r"^receipttrip:\d+$"),CallbackQueryHandler(cancel_confirm,pattern=r"^preconfirm:(yes|no):\d+$"),CallbackQueryHandler(export_confirmed,pattern=r"^pexport:confirmed:\d+$"),CallbackQueryHandler(profile_prebookings,pattern=r"^preprofile:open$"),CallbackQueryHandler(profile_prebooking_cb,pattern=r"^preprofile:(view|payment):\d+$"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^🎟 پیش‌رزروهای من$"),profile_prebookings),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE,receipt_photo),MessageHandler(filters.TEXT & ~filters.COMMAND,preadd_search)]
+    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(receipt_review,pattern=r"^receipt:(approve|reject):\d+$"),CallbackQueryHandler(receipt_trip_pick,pattern=r"^receipttrip:\d+$"),CallbackQueryHandler(cancel_confirm,pattern=r"^preconfirm:(yes|no):\d+$"),CallbackQueryHandler(export_confirmed,pattern=r"^pexport:confirmed:\d+$"),CallbackQueryHandler(profile_prebookings,pattern=r"^preprofile:open$"),CallbackQueryHandler(profile_prebooking_cb,pattern=r"^preprofile:(view|payment):\d+$"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^🎟 پیش‌رزروهای من$"),profile_prebookings),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE,receipt_photo),MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,preadd_search)]
