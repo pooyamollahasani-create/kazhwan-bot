@@ -57,6 +57,20 @@ class Prebooking(Base):
     created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
     updated_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
 
+class PrebookingGuest(Base):
+    """Offline prebooking: never invent a Telegram ID for an unregistered guest."""
+    __tablename__ = "prebooking_guests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trip_id: Mapped[int] = mapped_column(Integer, index=True)
+    full_name: Mapped[str] = mapped_column(String(255))
+    phone: Mapped[str] = mapped_column(String(50), default="")
+    status: Mapped[str] = mapped_column(String(20), default="prebooked")
+    price_snapshot: Mapped[int] = mapped_column(BigInteger, default=0)
+    discount_snapshot: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class PrebookingReceipt(Base):
     __tablename__="prebooking_receipts"
     id:Mapped[int]=mapped_column(Integer,primary_key=True,autoincrement=True)
@@ -150,6 +164,10 @@ async def repair_merged_prebookings(app):
                         WHEN 'confirmed' THEN 4 WHEN 'prebooked' THEN 3
                         WHEN 'waitlist' THEN 2 ELSE 1 END
             """), {"src": src, "dst": dst})
+            # Offline guests are independent records; preserve their IDs and details.
+            await ss.execute(sql_text(
+                "UPDATE prebooking_guests SET trip_id=:dst WHERE trip_id=:src"
+            ), {"src": src, "dst": dst})
             await ss.execute(sql_text("UPDATE prebooking_receipts SET trip_id=:dst WHERE trip_id=:src"),
                              {"src": src, "dst": dst})
             await ss.execute(sql_text("DELETE FROM prebookings WHERE trip_id=:src"),
@@ -202,7 +220,9 @@ async def counts(db,tid):
     async with db.sessions() as s:
         a=await s.scalar(select(func.count()).select_from(Prebooking).where(Prebooking.trip_id==tid,Prebooking.status.in_(["prebooked","confirmed"])))
         w=await s.scalar(select(func.count()).select_from(Prebooking).where(Prebooking.trip_id==tid,Prebooking.status=="waitlist"))
-        return int(a or 0),int(w or 0)
+        ga=await s.scalar(select(func.count()).select_from(PrebookingGuest).where(PrebookingGuest.trip_id==tid,PrebookingGuest.status.in_(["prebooked","confirmed"])))
+        gw=await s.scalar(select(func.count()).select_from(PrebookingGuest).where(PrebookingGuest.trip_id==tid,PrebookingGuest.status=="waitlist"))
+        return int(a or 0)+int(ga or 0),int(w or 0)+int(gw or 0)
 
 async def text(db,t,c):
     a,w=await counts(db,t.id); left=max(0,c.capacity-a)
@@ -218,6 +238,12 @@ async def text(db,t,c):
         async with db.sessions() as s:
             names=(await s.execute(select(User.full_name).join(Prebooking,Prebooking.telegram_id==User.telegram_id)
                  .where(Prebooking.trip_id==t.id,Prebooking.status.in_(["prebooked","confirmed"])).order_by(Prebooking.created_at))).scalars().all()
+        async with db.sessions() as s:
+            guest_names=(await s.execute(select(PrebookingGuest.full_name).where(
+                PrebookingGuest.trip_id==t.id,
+                PrebookingGuest.status.in_(["prebooked","confirmed"])
+            ).order_by(PrebookingGuest.created_at))).scalars().all()
+        names=list(names)+[f"{n} (دستی)" for n in guest_names]
         if names:lines+=["","👥 پیش‌رزروها:","، ".join(names)]
     return "\n".join(lines)
 
@@ -680,6 +706,11 @@ async def action(update,c):
                 .where(Prebooking.trip_id==tid)
                 .order_by(Prebooking.created_at.desc())
             )).all()
+        async with db.sessions() as session:
+            offline=(await session.execute(select(PrebookingGuest).where(
+                PrebookingGuest.trip_id==tid).order_by(PrebookingGuest.created_at.desc())
+            )).scalars().all()
+        rows=list(rows)+[(g.id,g.full_name+" (دستی)",g.status,g.price_snapshot,g.discount_snapshot) for g in offline]
         if not rows:
             await q.message.reply_text("هنوز کسی برای این سفر پیش‌رزرو نکرده است.")
             return ConversationHandler.END
@@ -697,7 +728,7 @@ async def action(update,c):
             keyboard=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     f"{lab.get(status,status)} | {name or ('شناسه '+str(uid))}"[:60],
-                    callback_data=f"pview:person:{tid}:{uid}")]
+                    callback_data=(f"padd:guestpick:{tid}:{uid}" if name and name.endswith(" (دستی)") else f"pview:person:{tid}:{uid}"))]
                 for uid,name,status,price,discount in page])
             await q.message.reply_text(
                 f"📋 مسافران {offset+1} تا {offset+len(page)} از {len(rows)}",
@@ -735,19 +766,59 @@ async def mine(update,c):
 async def preadd_start(update,c):
     q=update.callback_query
     if not admin(q.from_user.id,c):return
-    await q.answer();tid=await canonical_trip_id(c.application.bot_data["db"],int(q.data.split(":")[2]))
-    c.user_data["preadd_tid"]=tid;c.user_data["preadd_waiting"]=True
-    await q.message.reply_text("🔎 نام، شماره موبایل، KZH، BTC یا Telegram ID مسافر را وارد کن:")
+    await q.answer()
+    tid=await canonical_trip_id(c.application.bot_data["db"],int(q.data.split(":")[2]))
+    c.user_data["preadd_tid"]=tid
+    c.user_data["preadd_waiting"]=True
+    await q.message.reply_text(
+        "🔎 نام، شماره موبایل، KZH، BTC یا Telegram ID مسافر را وارد کن.\\n"
+        "اگر در ربات ثبت‌نام نکرده، پس از جستجو گزینه «افزودن مسافر بدون پروفایل» را بزن."
+    )
 
 async def preadd_search(update,c):
-    if update.effective_chat.type != "private" or not admin(update.effective_user.id,c) or not c.user_data.get("preadd_waiting"):return
-    value=(update.message.text or "").strip();db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(c.user_data["preadd_tid"]))
+    if update.effective_chat.type!="private" or not admin(update.effective_user.id,c) or not c.user_data.get("preadd_waiting"):return
+    if c.user_data.get("preadd_guest_phone_waiting"):
+        return await preadd_guest_phone(update,c)
+    value=(update.message.text or "").strip()
+    if not value:
+        await update.message.reply_text("نام مسافر را وارد کن.")
+        return
+    db=c.application.bot_data["db"]
+    tid=await canonical_trip_id(db,int(c.user_data["preadd_tid"]))
     users=await db.search_users(value,limit=10)
-    if not users:
-        await update.message.reply_text("مسافری پیدا نشد. دوباره جستجو کن.");return
     rows=[[InlineKeyboardButton(f"{u.full_name} | {u.phone}"[:60],callback_data=f"padd:pick:{tid}:{u.telegram_id}")] for u in users]
+    rows.append([InlineKeyboardButton("➕ افزودن مسافر بدون پروفایل",callback_data=f"padd:guest:{tid}")])
     rows.append([InlineKeyboardButton("❌ لغو",callback_data=f"padd:cancel:{tid}")])
-    await update.message.reply_text("مسافر را انتخاب کن:",reply_markup=InlineKeyboardMarkup(rows))
+    c.user_data["preadd_guest_name"]=value
+    await update.message.reply_text(
+        ("مسافر را انتخاب کن، یا اگر پروفایل ندارد دستی اضافه کن:" if users else
+         "پروفایلی پیدا نشد؛ می‌توانی مسافر را بدون تلگرام ثبت کنی:"),
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def preadd_guest_phone(update,c):
+    if update.effective_chat.type!="private" or not admin(update.effective_user.id,c) or not c.user_data.get("preadd_guest_phone_waiting"):
+        return
+    phone=(update.message.text or "").strip()
+    if phone=="-":phone=""
+    if len(phone)>50:
+        await update.message.reply_text("شماره خیلی طولانی است؛ شماره کوتاه‌تر یا - بفرست.")
+        return
+    c.user_data["preadd_guest_phone"]=phone
+    c.user_data.pop("preadd_guest_phone_waiting",None)
+    tid=int(c.user_data["preadd_tid"])
+    name=c.user_data["preadd_guest_name"]
+    await update.message.reply_text(
+        f"👤 {name}\\n📱 {phone or 'بدون شماره'}\\nوضعیت را انتخاب کن:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🟡 پیش‌رزرو",callback_data=f"padd:guestset:{tid}:prebooked"),
+             InlineKeyboardButton("🟢 رزرو قطعی",callback_data=f"padd:guestset:{tid}:confirmed")],
+            [InlineKeyboardButton("⏳ لیست انتظار",callback_data=f"padd:guestset:{tid}:waitlist")],
+            [InlineKeyboardButton("❌ انصراف",callback_data=f"padd:cancel:{tid}")]
+        ])
+    )
+
 
 async def preadd_cb(update,c):
     q=update.callback_query
@@ -755,6 +826,73 @@ async def preadd_cb(update,c):
     await q.answer();z=q.data.split(":");act=z[1];db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(z[2]))
     if act=="cancel":
         c.user_data.pop("preadd_waiting",None);c.user_data.pop("preadd_tid",None);await q.edit_message_text("لغو شد.");return
+    if act=="guest":
+        name=c.user_data.get("preadd_guest_name","").strip()
+        if not name or len(name)>255:
+            await q.message.reply_text("نام معتبر نیست؛ دوباره از افزودن مسافر شروع کن.")
+            return
+        c.user_data["preadd_guest_phone_waiting"]=True
+        await q.message.reply_text(f"👤 {name}\\nشماره موبایل را بفرست؛ اگر نداری علامت - بفرست:")
+        return
+    if act=="guestset":
+        name=c.user_data.get("preadd_guest_name","").strip()
+        phone=c.user_data.get("preadd_guest_phone","")
+        status=z[3]
+        if not name or status not in ("prebooked","confirmed","waitlist") or c.user_data.get("preadd_tid")!=tid:
+            await q.message.reply_text("اطلاعات ثبت دستی منقضی شده؛ دوباره شروع کن.")
+            return
+        x=await cfg(db,tid,True)
+        async with db.sessions() as ss:
+            # Avoid duplicate offline entries for the same name and phone on this trip.
+            existing=(await ss.execute(select(PrebookingGuest).where(
+                PrebookingGuest.trip_id==tid,
+                PrebookingGuest.full_name==name,
+                PrebookingGuest.phone==phone
+            ).order_by(PrebookingGuest.id.desc()).limit(1))).scalar_one_or_none()
+            if existing:
+                existing.status=status
+                existing.updated_at=datetime.now(timezone.utc)
+            else:
+                ss.add(PrebookingGuest(
+                    trip_id=tid,full_name=name,phone=phone,status=status,
+                    price_snapshot=max(0,x.regular_price-x.early_discount),
+                    discount_snapshot=x.early_discount
+                ))
+            await ss.commit()
+        for key in ("preadd_waiting","preadd_tid","preadd_guest_name","preadd_guest_phone","preadd_guest_phone_waiting"):
+            c.user_data.pop(key,None)
+        await q.edit_message_text(f"✅ {name} بدون پروفایل تلگرام ثبت شد.")
+        await refresh(c,tid)
+        return
+    if act=="gueststatus":
+        guest_id=int(z[3]);status=z[4]
+        if status not in ("prebooked","confirmed","waitlist","cancelled"):return
+        async with db.sessions() as ss:
+            guest=await ss.get(PrebookingGuest,guest_id)
+            if not guest or guest.trip_id!=tid:
+                await q.message.reply_text("مسافر پیدا نشد.");return
+            guest.status=status
+            guest.updated_at=datetime.now(timezone.utc)
+            name=guest.full_name
+            await ss.commit()
+        await q.edit_message_text(f"✅ وضعیت {name} تغییر کرد.")
+        await refresh(c,tid)
+        return
+    if act=="guestpick":
+        guest_id=int(z[3])
+        async with db.sessions() as ss:
+            guest=await ss.get(PrebookingGuest,guest_id)
+            if not guest or guest.trip_id!=tid:
+                await q.message.reply_text("مسافر پیدا نشد.");return
+            name=guest.full_name
+        await q.edit_message_text(f"👤 {name} (ثبت دستی)\\nوضعیت جدید:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🟡 پیش‌رزرو",callback_data=f"padd:gueststatus:{tid}:{guest_id}:prebooked"),
+                 InlineKeyboardButton("🟢 قطعی",callback_data=f"padd:gueststatus:{tid}:{guest_id}:confirmed")],
+                [InlineKeyboardButton("⏳ انتظار",callback_data=f"padd:gueststatus:{tid}:{guest_id}:waitlist"),
+                 InlineKeyboardButton("⚪ لغو",callback_data=f"padd:gueststatus:{tid}:{guest_id}:cancelled")]
+            ]))
+        return
     uid=int(z[3])
     if act=="pick":
         u=await db.get_user(uid)
