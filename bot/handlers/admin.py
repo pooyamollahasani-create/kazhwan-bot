@@ -1017,7 +1017,10 @@ async def trip_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     q=update.callback_query
     if not q or not is_admin(q.from_user.id,context) or q.message.chat.type!=ChatType.PRIVATE:
         return ConversationHandler.END
-    await q.answer()
+    try:
+        await q.answer()
+    except Exception:
+        pass
     action,tid=q.data.split(":")[1:]
     trip=await context.application.bot_data["db"].get_trip(int(tid))
     if not trip or trip.archived:
@@ -1295,6 +1298,11 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     action = parts[1]
     db = context.application.bot_data["db"]
 
+    # v1.13.1: explicit fallback routing for trip edit/link buttons.
+    if action in ("edit", "linkgroup"):
+        await trip_edit_start(update, context)
+        return
+
     if action == "archived":
         trips = await db.list_archived_trips(limit=30)
         rows = []
@@ -1548,6 +1556,13 @@ async def guest_match_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception("Could not notify linked guest traveler %s", telegram_id)
 
 
+async def trip_edit_fallback_input(update, context):
+    # Never intercept normal messages unless a trip edit is explicitly pending.
+    if not context.user_data.get("trip_edit_id") or context.user_data.get("trip_edit_mode") not in ("field", "linkgroup"):
+        return
+    await trip_edit_value(update, context)
+
+
 def admin_handlers():
     return [
         build_admin_flow_handler(),
@@ -1565,4 +1580,6 @@ def admin_handlers():
         CallbackQueryHandler(member_profile_callback, pattern=r"^memberprofile:(view|history):\d+$"),
         CallbackQueryHandler(guest_match_callback, pattern=r"^guestmatch:(link|skip):\d+:\d+$"),
         CallbackQueryHandler(trip_admin_callback, pattern=r"^tripadmin:"),
+        CallbackQueryHandler(trip_edit_field, pattern=r"^tripedit:(field|type):\d+:[a-z_]+$"),
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, trip_edit_fallback_input),
     ]
