@@ -18,6 +18,7 @@ from bot.db import Trip
 logger = logging.getLogger(__name__)
 
 MANUAL_TRIP_TITLE, MANUAL_TRIP_TYPE, MANUAL_TRIP_START, MANUAL_TRIP_END, MANUAL_GUEST_NAME, MANUAL_GUEST_PHONE, MANUAL_GUEST_STATUS, MANUAL_TRIP_DUPLICATE = range(100, 108)
+TRIP_EDIT_INPUT = 108
 QUIET_START_INPUT, QUIET_END_INPUT = range(200, 202)
 MEMBER_SEARCH_INPUT = 300
 MANUAL_POINTS_AMOUNT, MANUAL_POINTS_REASON = range(310, 312)
@@ -102,6 +103,8 @@ def _trip_list_keyboard(trips) -> InlineKeyboardMarkup:
 
 def _trip_actions_keyboard(trip) -> InlineKeyboardMarkup:
     rows = [
+        [InlineKeyboardButton("✏️ ویرایش اطلاعات سفر", callback_data=f"tripadmin:edit:{trip.id}")],
+        [InlineKeyboardButton("🔗 اتصال گروه موجود", callback_data=f"tripadmin:linkgroup:{trip.id}")],
         [InlineKeyboardButton("➕ افزودن مسافر دستی", callback_data=f"tripadmin:addguest:{trip.id}")],
         [
             InlineKeyboardButton("👥 مسافران", callback_data=f"tripadmin:participants:{trip.id}:0"),
@@ -1009,13 +1012,100 @@ async def admin_flow_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
+
+async def trip_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    q=update.callback_query
+    if not q or not is_admin(q.from_user.id,context) or q.message.chat.type!=ChatType.PRIVATE:
+        return ConversationHandler.END
+    await q.answer()
+    action,tid=q.data.split(":")[1:]
+    trip=await context.application.bot_data["db"].get_trip(int(tid))
+    if not trip or trip.archived:
+        await q.message.reply_text("سفر فعال پیدا نشد.");return ConversationHandler.END
+    context.user_data["trip_edit_id"]=trip.id
+    context.user_data["trip_edit_mode"]=action
+    if action=="linkgroup":
+        await q.message.reply_text("شناسه عددی گروه تلگرام سفر را بفرست (مثلاً -1001234567890).\n⚠️ اگر گروه به سفر دیگری متصل باشد، اتصال قبلی تغییر می‌کند. این کار رزروها را ادغام نمی‌کند.\nبرای انصراف /cancel",reply_markup=ForceReply(selective=True))
+        return TRIP_EDIT_INPUT
+    buttons=[[InlineKeyboardButton("📝 نام سفر",callback_data=f"tripedit:field:{tid}:title")],
+             [InlineKeyboardButton("📅 تاریخ شروع",callback_data=f"tripedit:field:{tid}:start_date_text"),InlineKeyboardButton("📅 تاریخ پایان",callback_data=f"tripedit:field:{tid}:end_date_text")],
+             [InlineKeyboardButton("🇮🇷 یک‌روزه",callback_data=f"tripedit:type:{tid}:domestic_day"),InlineKeyboardButton("🇮🇷 چندروزه",callback_data=f"tripedit:type:{tid}:domestic_multi")],
+             [InlineKeyboardButton("🌍 خارجی",callback_data=f"tripedit:type:{tid}:international")],
+             [InlineKeyboardButton("⬅️ بازگشت",callback_data=f"tripadmin:view:{tid}")]]
+    await q.message.reply_text(f"✏️ ویرایش «{trip.title}»\nتاریخ: {trip.start_date_text} تا {trip.end_date_text}\nفیلد موردنظر را انتخاب کن:",reply_markup=InlineKeyboardMarkup(buttons))
+    return ConversationHandler.END
+
+async def trip_edit_field(update: Update,context: ContextTypes.DEFAULT_TYPE) -> int:
+    q=update.callback_query
+    if not q or not is_admin(q.from_user.id,context) or q.message.chat.type!=ChatType.PRIVATE:return ConversationHandler.END
+    await q.answer();z=q.data.split(":");tid=int(z[2]);field=z[3]
+    db=context.application.bot_data["db"];trip=await db.get_trip(tid)
+    if not trip or trip.archived:return ConversationHandler.END
+    if z[1]=="type":
+        from bot.db import TRIP_POINTS
+        async with db.sessions() as s:
+            row=await s.get(Trip,tid);row.trip_type=field;row.points_value=TRIP_POINTS.get(field,0);row.updated_at=datetime.now(timezone.utc);await s.commit()
+        await _refresh_trip_prebooking(context,tid)
+        await q.message.reply_text("✅ نوع سفر و امتیاز پیش‌فرض ویرایش شد. امتیازهای قبلاً اعطاشده تغییر نکردند.",reply_markup=_trip_actions_keyboard(await db.get_trip(tid)))
+        return ConversationHandler.END
+    if field not in {"title","start_date_text","end_date_text"}:return ConversationHandler.END
+    context.user_data["trip_edit_id"]=tid;context.user_data["trip_edit_field"]=field;context.user_data["trip_edit_mode"]="field"
+    await q.message.reply_text(f"مقدار جدید «{field}» را وارد کن.\nبرای انصراف /cancel",reply_markup=ForceReply(selective=True))
+    return TRIP_EDIT_INPUT
+
+async def _refresh_trip_prebooking(context,tid):
+    try:
+        from bot.handlers.prebooking import refresh
+        await refresh(context,tid)
+    except Exception:
+        logger.exception("Trip %s edited, but prebooking announcement refresh failed",tid)
+
+async def trip_edit_value(update: Update,context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_chat.type!=ChatType.PRIVATE or not is_admin(update.effective_user.id,context):return ConversationHandler.END
+    tid=context.user_data.get("trip_edit_id");mode=context.user_data.get("trip_edit_mode")
+    value=(update.effective_message.text or "").strip();db=context.application.bot_data["db"]
+    if not tid or not value:return ConversationHandler.END
+    if mode=="linkgroup":
+        try:
+            chatid=int(value)
+            if chatid>=0:raise ValueError()
+        except ValueError:
+            await update.message.reply_text("شناسه گروه معتبر نیست. یک عدد منفی بفرست.");return TRIP_EDIT_INPUT
+        # Require explicit confirmation when the group already belongs to another trip.
+        old=await db.get_trip_by_chat_id(chatid)
+        if old and old.id!=tid:
+            await update.message.reply_text(f"⚠️ این گروه الان به سفر «{old.title}» متصل است. برای جلوگیری از قطع اتصال ناخواسته، ابتدا وضعیت دو سفر را بررسی کن. هیچ تغییری اعمال نشد.")
+            context.user_data.pop("trip_edit_mode",None);return ConversationHandler.END
+        result=await db.link_trip_to_chat(tid,chatid)
+        if not result:await update.message.reply_text("اتصال انجام نشد.")
+        else:await update.message.reply_text(f"✅ گروه به سفر «{result.title}» متصل شد. پیش‌رزروهای قبلی تغییر نکردند.",reply_markup=_trip_actions_keyboard(result))
+        context.user_data.pop("trip_edit_mode",None);return ConversationHandler.END
+    field=context.user_data.get("trip_edit_field")
+    if field not in {"title","start_date_text","end_date_text"}:return ConversationHandler.END
+    if field=="title" and (len(value)<2 or len(value)>200):
+        await update.message.reply_text("عنوان باید بین ۲ تا ۲۰۰ نویسه باشد.");return TRIP_EDIT_INPUT
+    if len(value)>80 and field!="title":
+        await update.message.reply_text("تاریخ طولانی است.");return TRIP_EDIT_INPUT
+    async with db.sessions() as s:
+        trip=await s.get(Trip,tid)
+        if not trip or trip.archived:return ConversationHandler.END
+        setattr(trip,field,value);trip.updated_at=datetime.now(timezone.utc);await s.commit()
+    context.user_data.pop("trip_edit_mode",None);context.user_data.pop("trip_edit_field",None)
+    await _refresh_trip_prebooking(context,tid)
+    trip=await db.get_trip(tid)
+    await update.message.reply_text(f"✅ اطلاعات «{trip.title}» ذخیره شد. اطلاعیه‌های فعال پیش‌رزرو برای به‌روزرسانی بررسی شدند.",reply_markup=_trip_actions_keyboard(trip))
+    return ConversationHandler.END
+
 def build_admin_flow_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
             CallbackQueryHandler(manual_trip_start, pattern=r"^tripadmin:new$"),
+            CallbackQueryHandler(trip_edit_start, pattern=r"^tripadmin:(edit|linkgroup):\d+$"),
+            CallbackQueryHandler(trip_edit_field, pattern=r"^tripedit:(field|type):\d+:[a-z_]+$"),
             CallbackQueryHandler(manual_guest_start, pattern=r"^tripadmin:addguest:\d+$"),
         ],
         states={
+            TRIP_EDIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, trip_edit_value)],
             MANUAL_TRIP_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_trip_title)],
             MANUAL_TRIP_TYPE: [CallbackQueryHandler(manual_trip_type, pattern=r"^manualtriptype:(domestic_day|domestic_multi|international)$")],
             MANUAL_TRIP_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_trip_start_date)],
