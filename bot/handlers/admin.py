@@ -70,7 +70,7 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 آمار", callback_data="admin:stats"),
             InlineKeyboardButton("👥 اعضا", callback_data="admin:members"),
         ],
-        [InlineKeyboardButton("🧳 مدیریت سفرها", callback_data="admin:trips")],
+        [InlineKeyboardButton("📋 مدیریت همه سفرها", callback_data="admin:trips")],
         [InlineKeyboardButton("🔕 مدیریت ساعت سکوت", callback_data="admin:quiet")],
         [
             InlineKeyboardButton("⏳ غیرفعال ۳۰ روز", callback_data="admin:inactive30"),
@@ -91,14 +91,59 @@ def _back_admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")]])
 
 
-def _trip_list_keyboard(trips) -> InlineKeyboardMarkup:
+def _trip_list_keyboard(trips, page=0, per_page=12) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("➕ تعریف سفر جدید", callback_data="tripadmin:new")]]
-    for trip in trips[:30]:
-        label = f"{TRIP_STATUS_LABELS.get(trip.status, trip.status)} | {trip.title} | {trip.trip_code}"
+    start = page * per_page
+    for trip in trips[start:start + per_page]:
+        label = f"#{trip.id} | {trip.title} | {trip.start_date_text}"
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"tripadmin:view:{trip.id}")])
+    nav = []
+    if page:
+        nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"tripadmin:all:{page-1}"))
+    if start + per_page < len(trips):
+        nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"tripadmin:all:{page+1}"))
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton("🗃 سفرهای آرشیوشده", callback_data="tripadmin:archived")])
     rows.append([InlineKeyboardButton("⬅️ پنل مدیریت", callback_data="admin:home")])
     return InlineKeyboardMarkup(rows)
+
+
+async def _show_all_trips(update, context, page=0):
+    db = context.application.bot_data["db"]
+    trips = await _list_trips_compat(db, limit=5000)
+    # Both manual/group trips and prebooking-only trips are stored in Trip.
+    page = max(0, min(page, max(0, (len(trips)-1)//12)))
+    await update.callback_query.message.reply_text(
+        f"📋 مدیریت همه سفرها\\n\\nتعداد سفرهای فعال: {len(trips)}\\n"
+        "همه سفرها، شامل سفرهای دارای پیش‌رزرو و سفرهای گروهی، در این فهرست هستند.\\n"
+        "شماره # شناسه واقعی سفر است؛ برای مشاهده و اتصال، همان سفر دارای پیش‌رزرو را انتخاب کن.\\n"
+        f"صفحه {page+1} از {max(1, (len(trips)+11)//12)}",
+        reply_markup=_trip_list_keyboard(trips, page),
+    )
+
+
+async def _prebooking_summary(db, trip_id):
+    try:
+        from bot.handlers.prebooking import Prebooking, PrebookingSettings
+        from sqlalchemy import func
+        async with db.sessions() as session:
+            settings = await session.get(PrebookingSettings, trip_id)
+            result = await session.execute(
+                select(Prebooking.status, func.count())
+                .where(Prebooking.trip_id == trip_id)
+                .group_by(Prebooking.status)
+            )
+            counts = dict(result.all())
+        return (
+            f"📋 پیش‌رزرو: {counts.get('prebooked', 0)} | "
+            f"قطعی: {counts.get('confirmed', 0)} | "
+            f"انتظار: {counts.get('waitlist', 0)}\\n"
+            f"تنظیمات پیش‌رزرو: {'فعال' if settings and settings.enabled else 'غیرفعال'}"
+        )
+    except Exception:
+        return "📋 آمار پیش‌رزرو فعلاً قابل خواندن نیست."
+
 
 
 def _trip_actions_keyboard(trip) -> InlineKeyboardMarkup:
@@ -1305,6 +1350,10 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await trip_edit_start(update, context)
         return
 
+    if action == "all":
+        await _show_all_trips(update, context, int(parts[2]))
+        return
+
     if action == "archived":
         trips = await db.list_archived_trips(limit=30)
         rows = []
@@ -1420,13 +1469,14 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         declared = sum(1 for item in people if item["status"] == "declared")
         cancelled = sum(1 for item in people if item["status"] == "cancelled")
         guests = sum(1 for item in people if item["kind"] == "guest")
-        group_text = "متصل به گروه تلگرام" if trip.telegram_chat_id else "ثبت دستی — بدون گروه"
+        group_text = f"متصل به گروه {trip.telegram_chat_id}" if trip.telegram_chat_id else "بدون گروه اختصاصی"
+        prebooking_summary = await _prebooking_summary(db, trip.id)
         await query.message.reply_text(
             f"🧳 {trip.title}\n🆔 {trip.trip_code}\n📅 {jalali_date(trip.start_date_text)} تا {jalali_date(trip.end_date_text)}\n"
             f"نوع: {TRIP_TYPE_LABELS.get(trip.trip_type, trip.trip_type)}\n⭐ امتیاز: {trip.points_value}\n"
             f"وضعیت: {TRIP_STATUS_LABELS.get(trip.status, trip.status)}\n📌 {group_text}\n\n"
             f"🟡 اعلام حضور: {declared}\n🟢 شرکت کرده: {attended}\n⚪ انصراف: {cancelled}\n"
-            f"📝 مسافر موقت: {guests}",
+            f"📝 مسافر موقت: {guests}\\n\\n{prebooking_summary}\\n🆔 Trip ID: {trip.id}",
             reply_markup=_trip_actions_keyboard(trip),
         )
     elif action == "participants":
