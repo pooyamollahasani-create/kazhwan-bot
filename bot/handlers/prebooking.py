@@ -566,15 +566,37 @@ async def action(update,c):
     if a=="publish":
         await publication_picker(q,c,tid);return ConversationHandler.END
     if a=="list":
-        async with db.sessions() as s:
-            rows=(await s.execute(select(User.full_name,Prebooking.status,Prebooking.price_snapshot,Prebooking.discount_snapshot).join(Prebooking,Prebooking.telegram_id==User.telegram_id).where(Prebooking.trip_id==tid).order_by(Prebooking.created_at))).all()
-        lab={"prebooked":"🟡 پیش‌رزرو","confirmed":"🟢 قطعی","waitlist":"⏳ انتظار","cancelled":"⚪ لغو"}
+        async with db.sessions() as session:
+            rows=(await session.execute(
+                select(Prebooking.telegram_id,User.full_name,Prebooking.status,
+                       Prebooking.price_snapshot,Prebooking.discount_snapshot)
+                .outerjoin(User,User.telegram_id==Prebooking.telegram_id)
+                .where(Prebooking.trip_id==tid)
+                .order_by(Prebooking.created_at.desc())
+            )).all()
         if not rows:
-            await q.message.reply_text("هنوز کسی ثبت نشده.");return ConversationHandler.END
-        async with db.sessions() as ss:
-            rr=(await ss.execute(select(User.telegram_id,User.full_name,Prebooking.status).join(Prebooking,Prebooking.telegram_id==User.telegram_id).where(Prebooking.trip_id==tid).order_by(Prebooking.created_at))).all()
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton(f"{lab.get(st,st)} | {name}"[:60],callback_data=f"pview:person:{tid}:{uid}")] for uid,name,st in rr])
-        await q.message.reply_text("👥 پیش‌رزروها — برای تغییر وضعیت روی نام بزن:",reply_markup=kb)
+            await q.message.reply_text("هنوز کسی برای این سفر پیش‌رزرو نکرده است.")
+            return ConversationHandler.END
+        lab={"prebooked":"🟡 پیش‌رزرو","confirmed":"🟢 قطعی",
+             "waitlist":"⏳ انتظار","cancelled":"⚪ لغوشده"}
+        total={key:sum(1 for row in rows if row[2]==key) for key in lab}
+        await q.message.reply_text(
+            "👥 فهرست پیش‌رزروهای این سفر\n"
+            f"🟡 پیش‌رزرو: {total['prebooked']} | 🟢 قطعی: {total['confirmed']}\n"
+            f"⏳ انتظار: {total['waitlist']} | ⚪ لغوشده: {total['cancelled']}\n\n"
+            "برای تغییر وضعیت روی نام مسافر بزن:")
+        # Telegram limits inline keyboards; paginate the output in small batches.
+        for offset in range(0,len(rows),20):
+            page=rows[offset:offset+20]
+            keyboard=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    f"{lab.get(status,status)} | {name or ('شناسه '+str(uid))}"[:60],
+                    callback_data=f"pview:person:{tid}:{uid}")]
+                for uid,name,status,price,discount in page])
+            await q.message.reply_text(
+                f"📋 مسافران {offset+1} تا {offset+len(page)} از {len(rows)}",
+                reply_markup=keyboard)
+        return ConversationHandler.END
     return ConversationHandler.END
 
 async def value(update,c):
