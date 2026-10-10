@@ -124,15 +124,18 @@ async def text(db,t,c):
     return "\n".join(lines)
 
 def public_kb(tid,full=False):
+    # Telegram deep link: a group tap never posts a registration message to the group.
     label="⏳ ورود به لیست انتظار" if full else "✅ پیش‌رزرو"
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label,callback_data=f"pre:join:{tid}"),
-                                  InlineKeyboardButton("❌ لغو",callback_data=f"pre:cancel:{tid}")],
-                                 [InlineKeyboardButton("🔄 بروزرسانی",callback_data=f"pre:refresh:{tid}")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label,url=f"https://t.me/{_prebooking_bot_username}?start=prebook_{tid}")]])
+
+_prebooking_bot_username = "Kazhwantourbot"
 
 async def refresh(c,tid):
     db=c.application.bot_data["db"]; x=await cfg(db,tid); t=await trip(db,tid)
     if not x or not t:return
     a,_=await counts(db,tid)
+    global _prebooking_bot_username
+    _prebooking_bot_username=(await c.bot.get_me()).username
     body=await text(db,t,x); kb=public_kb(tid,a>=x.capacity and x.waitlist)
     async with db.sessions() as ss:
         pubs=(await ss.execute(select(PrebookingPublication).where(
@@ -150,6 +153,9 @@ async def refresh(c,tid):
 
 async def passenger(update:Update,c:ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; action,tid=q.data.split(":")[1:];tid=int(tid)
+    if update.effective_chat.type != "private":
+        await q.answer("برای پیش‌رزرو از دکمه جدید اطلاعیه استفاده کنید و وارد PV ربات شوید.",show_alert=True)
+        return
     db=c.application.bot_data["db"]; x=await cfg(db,tid);t=await trip(db,tid)
     if not x or not x.enabled or not t:await q.answer("پیش‌رزرو فعال نیست.",show_alert=True);return
     if action=="refresh":await q.answer("بروزرسانی شد");await refresh(c,tid);return
@@ -180,7 +186,7 @@ async def passenger(update:Update,c:ContextTypes.DEFAULT_TYPE):
                     f"🎁 تخفیف شما: {money(x.early_discount)}\n\n"
                     f"💳 شماره کارت/حساب/شبا:\n<code>{account}</code>"
                     + (f"\n👤 به نام: {recipient}" if recipient else "")
-                    + "\n\nبعد از واریز، عکس رسید را همین‌جا بفرستید.",
+                    + "\n\nبعد از واریز، عکس رسید را همین‌جا بفرستید.\n\n❌ برای لغو، از منوی اصلی ربات وارد «🎟 پیش‌رزروهای من» شوید و گزینه لغو سفر را انتخاب کنید.",
                     parse_mode="HTML")
         else:
             if not r or r.status not in ("prebooked","confirmed","waitlist"):await q.answer("رزرو فعالی ندارید.",show_alert=True);return
@@ -207,7 +213,10 @@ async def passenger(update:Update,c:ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_confirm(update,c):
-    q=update.callback_query;z=q.data.split(":");choice=z[1];tid=int(z[2])
+    q=update.callback_query
+    if update.effective_chat.type != "private":
+        await q.answer("لغو فقط در PV ربات امکان‌پذیر است.",show_alert=True);return
+    z=q.data.split(":");choice=z[1];tid=int(z[2])
     if choice=="no":
         await q.answer("لغو انجام نشد.");await q.edit_message_text("↩️ پیش‌رزرو شما بدون تغییر باقی ماند.");return
     db=c.application.bot_data["db"];x=await cfg(db,tid);t=await trip(db,tid);now=datetime.now(timezone.utc)
@@ -489,6 +498,8 @@ async def publication_cb(update,c):
         x=await cfg(db,tid);t=await trip(db,tid)
         if not x.enabled or x.capacity<=0:
             await q.answer("اول پیش‌رزرو را فعال و ظرفیت را تعیین کن.",show_alert=True);return
+        global _prebooking_bot_username
+        _prebooking_bot_username=(await c.bot.get_me()).username
         aa,_=await counts(db,tid);body=await text(db,t,x);kb=public_kb(tid,aa>=x.capacity and x.waitlist)
         async with db.sessions() as ss:
             pubs=(await ss.execute(select(PrebookingPublication).where(
@@ -735,6 +746,7 @@ async def profile_prebookings(update,c):
             rows_kb.append([InlineKeyboardButton(f"💳 پرداخت و بررسی ثبت‌نام | {pay_state}"[:60],callback_data=f"preprofile:payment:{t.id}")])
         elif pb.status=="confirmed":
             rows_kb.append([InlineKeyboardButton("✅ مشاهده تأیید رزرو",callback_data=f"preprofile:payment:{t.id}")])
+        rows_kb.append([InlineKeyboardButton("❌ لغو پیش‌رزرو",callback_data=f"preprofile:cancel:{t.id}")])
     await update.effective_message.reply_text("🎟 پیش‌رزروهای من\n\nسفر موردنظر را انتخاب کنید:",reply_markup=InlineKeyboardMarkup(rows_kb))
 
 async def profile_prebooking_cb(update,c):
@@ -750,6 +762,16 @@ async def profile_prebooking_cb(update,c):
     if not pb or not t:
         await q.message.reply_text("این پیش‌رزرو پیدا نشد.");return
     sl={"prebooked":"🟡 پیش‌رزرو","confirmed":"🟢 رزرو قطعی","waitlist":"⏳ لیست انتظار","cancelled":"⚪ لغو"}
+    if act=="cancel":
+        if pb.status not in ("prebooked","confirmed","waitlist"):
+            await q.message.reply_text("رزرو فعالی برای لغو وجود ندارد.");return
+        await q.message.reply_text(
+            f"⚠️ آیا از لغو پیش‌رزرو «{t.title}» مطمئن هستید؟\nممکن است طبق قوانین سفر جریمه لغو اعمال شود.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ بله، لغو شود",callback_data=f"preconfirm:yes:{tid}"),
+                InlineKeyboardButton("↩️ خیر",callback_data=f"preconfirm:no:{tid}")
+            ]]))
+        return
     if act=="view":
         await q.message.reply_text(
             f"🧳 {t.title}\n"
@@ -776,4 +798,4 @@ async def profile_prebooking_cb(update,c):
         parse_mode="HTML")
 
 def handlers():
-    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(receipt_review,pattern=r"^receipt:(approve|reject):\d+$"),CallbackQueryHandler(receipt_trip_pick,pattern=r"^receipttrip:\d+$"),CallbackQueryHandler(cancel_confirm,pattern=r"^preconfirm:(yes|no):\d+$"),CallbackQueryHandler(export_confirmed,pattern=r"^pexport:confirmed:\d+$"),CallbackQueryHandler(profile_prebookings,pattern=r"^preprofile:open$"),CallbackQueryHandler(profile_prebooking_cb,pattern=r"^preprofile:(view|payment):\d+$"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^🎟 پیش‌رزروهای من$"),profile_prebookings),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE,receipt_photo),MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,preadd_search)]
+    return [flow(),CommandHandler("prebookinggroup",register_prebooking_group),CallbackQueryHandler(publication_cb,pattern=r"^ppub:"),CallbackQueryHandler(calendar_cb,pattern=r"^pc:"),CallbackQueryHandler(preadd_cb,pattern=r"^padd:"),CallbackQueryHandler(preperson_cb,pattern=r"^pview:person:"),CallbackQueryHandler(receipt_review,pattern=r"^receipt:(approve|reject):\d+$"),CallbackQueryHandler(receipt_trip_pick,pattern=r"^receipttrip:\d+$"),CallbackQueryHandler(cancel_confirm,pattern=r"^preconfirm:(yes|no):\d+$"),CallbackQueryHandler(export_confirmed,pattern=r"^pexport:confirmed:\d+$"),CallbackQueryHandler(profile_prebookings,pattern=r"^preprofile:open$"),CallbackQueryHandler(profile_prebooking_cb,pattern=r"^preprofile:(view|payment|cancel):\d+$"),CallbackQueryHandler(passenger,pattern=r"^pre:(join|cancel|refresh):\d+$"),MessageHandler(filters.Regex(r"^🎟 پیش‌رزروهای من$"),profile_prebookings),MessageHandler(filters.Regex(r"^📝 ثبت‌نام‌های من$"),mine),MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE,receipt_photo),MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,preadd_search)]
