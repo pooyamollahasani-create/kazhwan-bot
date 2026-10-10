@@ -105,6 +105,8 @@ def _trip_actions_keyboard(trip) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("✏️ ویرایش اطلاعات سفر", callback_data=f"tripadmin:edit:{trip.id}")],
         [InlineKeyboardButton("🔗 اتصال گروه موجود", callback_data=f"tripadmin:linkgroup:{trip.id}")],
+        [InlineKeyboardButton("💬 نظرسنجی سفر", callback_data=f"tripfeedback:view:{trip.id}")],
+        [InlineKeyboardButton("📋 مدیریت پیش‌رزرو", callback_data=f"pa:view:{trip.id}")],
         [InlineKeyboardButton("➕ افزودن مسافر دستی", callback_data=f"tripadmin:addguest:{trip.id}")],
         [
             InlineKeyboardButton("👥 مسافران", callback_data=f"tripadmin:participants:{trip.id}:0"),
@@ -1028,7 +1030,7 @@ async def trip_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     context.user_data["trip_edit_id"]=trip.id
     context.user_data["trip_edit_mode"]=action
     if action=="linkgroup":
-        await q.message.reply_text("شناسه عددی گروه تلگرام سفر را بفرست (مثلاً -1001234567890).\n⚠️ اگر گروه به سفر دیگری متصل باشد، اتصال قبلی تغییر می‌کند. این کار رزروها را ادغام نمی‌کند.\nبرای انصراف /cancel",reply_markup=ForceReply(selective=True))
+        await q.message.reply_text("شناسه عددی گروه تلگرام سفر را بفرست (مثلاً -1001234567890).\n⚠️ اگر گروه به سفر دیگری متصل باشد، اتصال انجام نمی‌شود. این کار رزروها را ادغام نمی‌کند.\nبرای انصراف /cancel",reply_markup=ForceReply(selective=True))
         return TRIP_EDIT_INPUT
     buttons=[[InlineKeyboardButton("📝 نام سفر",callback_data=f"tripedit:field:{tid}:title")],
              [InlineKeyboardButton("📅 تاریخ شروع",callback_data=f"tripedit:field:{tid}:start_date_text"),InlineKeyboardButton("📅 تاریخ پایان",callback_data=f"tripedit:field:{tid}:end_date_text")],
@@ -1581,5 +1583,4 @@ def admin_handlers():
         CallbackQueryHandler(guest_match_callback, pattern=r"^guestmatch:(link|skip):\d+:\d+$"),
         CallbackQueryHandler(trip_admin_callback, pattern=r"^tripadmin:"),
         CallbackQueryHandler(trip_edit_field, pattern=r"^tripedit:(field|type):\d+:[a-z_]+$"),
-        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, trip_edit_fallback_input),
     ]
