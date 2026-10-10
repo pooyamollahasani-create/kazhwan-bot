@@ -1449,6 +1449,18 @@ async def trip_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif action == "mergeconfirm":
         source_id, target_id = int(parts[2]), int(parts[3])
         result = await db.merge_trips(source_id, target_id)
+        if result:
+            from bot.handlers.prebooking import repair_merged_prebookings
+            try:
+                await repair_merged_prebookings(context.application)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Prebooking repair after trip merge failed")
+                await query.message.reply_text(
+                    "⚠️ سفرها ادغام شدند ولی انتقال پیش‌رزرو کامل نشد. "
+                    "تا رفع خطا، ادغام دیگری انجام ندهید؛ اطلاعات قدیمی حذف نشده است."
+                )
+                return
         if not result:
             await query.message.reply_text("ادغام انجام نشد؛ وضعیت سفرها را بررسی کنید.")
             return

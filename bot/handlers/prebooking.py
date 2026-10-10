@@ -68,6 +68,104 @@ class PrebookingReceipt(Base):
     reviewed_at:Mapped[datetime|None]=mapped_column(DateTime(timezone=True),nullable=True)
     reviewed_by:Mapped[int|None]=mapped_column(BigInteger,nullable=True)
 
+async def canonical_trip_id(db, tid):
+    """Resolve explicit merge chain, never guess using title or dates."""
+    seen = set()
+    async with db.sessions() as ss:
+        while tid not in seen:
+            seen.add(tid)
+            t = await ss.get(Trip, tid)
+            if not t or not t.merged_into_trip_id:
+                return tid
+            tid = t.merged_into_trip_id
+    raise ValueError("Cyclic merged trip IDs")
+
+
+async def repair_merged_prebookings(app):
+    """Idempotently recover old prebookings, receipts and settings after a merge.
+
+    Source publication rows stay intact so *both* old and new Telegram
+    announcements can be edited; their buttons resolve to the canonical ID.
+    """
+    db = app.bot_data["db"]
+    from sqlalchemy import text as sql_text
+    async with db.sessions() as ss:
+        sources = (await ss.execute(select(Trip.id).where(
+            Trip.archived.is_(True), Trip.merged_into_trip_id.is_not(None)
+        ))).scalars().all()
+    targets = set()
+    for src in sources:
+        dst = await canonical_trip_id(db, src)
+        if src == dst:
+            continue
+        async with db.sessions() as ss:
+            # Lock and migrate atomically; startup can be safely repeated.
+            await ss.execute(sql_text("SELECT id FROM trips WHERE id IN (:src,:dst) ORDER BY id FOR UPDATE"),
+                             {"src": src, "dst": dst})
+            await ss.execute(sql_text("""
+                INSERT INTO prebooking_settings
+                (trip_id, enabled, capacity, regular_price, early_discount,
+                 deadline_at, execution_at, cancel_hours, cancel_from_at,
+                 payment_recipient, payment_account, cancel_points, waitlist,
+                 show_names, chat_id, message_id)
+                SELECT :dst, enabled, capacity, regular_price, early_discount,
+                       deadline_at, execution_at, cancel_hours, cancel_from_at,
+                       payment_recipient, payment_account, cancel_points, waitlist,
+                       show_names, chat_id, message_id
+                FROM prebooking_settings WHERE trip_id=:src
+                ON CONFLICT (trip_id) DO UPDATE SET
+                    enabled=EXCLUDED.enabled, capacity=EXCLUDED.capacity,
+                    regular_price=EXCLUDED.regular_price,
+                    early_discount=EXCLUDED.early_discount,
+                    deadline_at=EXCLUDED.deadline_at,
+                    execution_at=EXCLUDED.execution_at,
+                    cancel_hours=EXCLUDED.cancel_hours,
+                    cancel_from_at=EXCLUDED.cancel_from_at,
+                    payment_recipient=EXCLUDED.payment_recipient,
+                    payment_account=EXCLUDED.payment_account,
+                    cancel_points=EXCLUDED.cancel_points,
+                    waitlist=EXCLUDED.waitlist,
+                    show_names=EXCLUDED.show_names,
+                    chat_id=EXCLUDED.chat_id, message_id=EXCLUDED.message_id
+                WHERE prebooking_settings.enabled=FALSE AND EXCLUDED.enabled=TRUE
+            """), {"src": src, "dst": dst})
+            await ss.execute(sql_text("""
+                INSERT INTO prebookings
+                (trip_id, telegram_id, status, price_snapshot, discount_snapshot,
+                 penalty_points, created_at, updated_at)
+                SELECT :dst, telegram_id, status, price_snapshot,
+                       discount_snapshot, penalty_points, created_at, updated_at
+                FROM prebookings WHERE trip_id=:src
+                ON CONFLICT (trip_id, telegram_id) DO UPDATE SET
+                    status=EXCLUDED.status,
+                    price_snapshot=EXCLUDED.price_snapshot,
+                    discount_snapshot=EXCLUDED.discount_snapshot,
+                    penalty_points=EXCLUDED.penalty_points,
+                    created_at=LEAST(prebookings.created_at, EXCLUDED.created_at),
+                    updated_at=GREATEST(prebookings.updated_at, EXCLUDED.updated_at)
+                WHERE CASE EXCLUDED.status
+                        WHEN 'confirmed' THEN 4 WHEN 'prebooked' THEN 3
+                        WHEN 'waitlist' THEN 2 ELSE 1 END
+                    > CASE prebookings.status
+                        WHEN 'confirmed' THEN 4 WHEN 'prebooked' THEN 3
+                        WHEN 'waitlist' THEN 2 ELSE 1 END
+            """), {"src": src, "dst": dst})
+            await ss.execute(sql_text("UPDATE prebooking_receipts SET trip_id=:dst WHERE trip_id=:src"),
+                             {"src": src, "dst": dst})
+            await ss.execute(sql_text("DELETE FROM prebookings WHERE trip_id=:src"),
+                             {"src": src})
+            await ss.commit()
+        targets.add(dst)
+        log.info("Repaired prebookings for merged trip %s -> %s", src, dst)
+    ctx = type("RepairContext", (), {"application": app, "bot": app.bot})()
+    for dst in targets:
+        try:
+            await refresh(ctx, dst)
+        except Exception:
+            log.exception("Failed to refresh merged trip %s", dst)
+    return len(targets)
+
+
 def admin(uid,c): return uid in c.application.bot_data["settings"].admin_ids
 def money(n): return f"{int(n or 0):,} تومان"
 def aware(d): return d.replace(tzinfo=timezone.utc) if d and d.tzinfo is None else d
@@ -131,20 +229,28 @@ def public_kb(tid,full=False):
 _prebooking_bot_username = "Kazhwantourbot"
 
 async def refresh(c,tid):
-    db=c.application.bot_data["db"]; x=await cfg(db,tid); t=await trip(db,tid)
+    db=c.application.bot_data["db"];tid=await canonical_trip_id(db,tid); x=await cfg(db,tid); t=await trip(db,tid)
     if not x or not t:return
     a,_=await counts(db,tid)
     global _prebooking_bot_username
     _prebooking_bot_username=(await c.bot.get_me()).username
     body=await text(db,t,x); kb=public_kb(tid,a>=x.capacity and x.waitlist)
     async with db.sessions() as ss:
+        merged_sources = (await ss.execute(select(Trip.id).where(
+            Trip.merged_into_trip_id==tid, Trip.archived.is_(True)))).scalars().all()
+        ids = [tid] + list(merged_sources)
         pubs=(await ss.execute(select(PrebookingPublication).where(
-            PrebookingPublication.trip_id==tid,PrebookingPublication.active.is_(True),
+            PrebookingPublication.trip_id.in_(ids),PrebookingPublication.active.is_(True),
             PrebookingPublication.message_id.is_not(None)))).scalars().all()
     # Backward compatibility: update old single publication if it exists and was not migrated yet.
     legacy=[]
-    if x.chat_id and x.message_id and not any(p.chat_id==x.chat_id for p in pubs):
+    if x.chat_id and x.message_id and not any(p.chat_id==x.chat_id and p.message_id==x.message_id for p in pubs):
         legacy=[(x.chat_id,x.message_id)]
+    for old_id in merged_sources:
+        old_cfg = await cfg(db,old_id)
+        if old_cfg and old_cfg.chat_id and old_cfg.message_id:
+            if not any(p.chat_id==old_cfg.chat_id and p.message_id==old_cfg.message_id for p in pubs):
+                legacy.append((old_cfg.chat_id,old_cfg.message_id))
     for chat_id,message_id in [(p.chat_id,p.message_id) for p in pubs]+legacy:
         try:
             await c.bot.edit_message_text(chat_id=chat_id,message_id=message_id,text=body,reply_markup=kb)
@@ -152,7 +258,7 @@ async def refresh(c,tid):
             if "not modified" not in str(e).lower():log.exception("prebooking refresh chat=%s",chat_id)
 
 async def passenger(update:Update,c:ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; action,tid=q.data.split(":")[1:];tid=int(tid)
+    q=update.callback_query; action,tid=q.data.split(":")[1:];tid=await canonical_trip_id(c.application.bot_data["db"],int(tid))
     if update.effective_chat.type != "private":
         await q.answer("برای پیش‌رزرو از دکمه جدید اطلاعیه استفاده کنید و وارد PV ربات شوید.",show_alert=True)
         return
@@ -216,7 +322,7 @@ async def cancel_confirm(update,c):
     q=update.callback_query
     if update.effective_chat.type != "private":
         await q.answer("لغو فقط در PV ربات امکان‌پذیر است.",show_alert=True);return
-    z=q.data.split(":");choice=z[1];tid=int(z[2])
+    z=q.data.split(":");choice=z[1];tid=await canonical_trip_id(c.application.bot_data["db"],int(z[2]))
     if choice=="no":
         await q.answer("لغو انجام نشد.");await q.edit_message_text("↩️ پیش‌رزرو شما بدون تغییر باقی ماند.");return
     db=c.application.bot_data["db"];x=await cfg(db,tid);t=await trip(db,tid);now=datetime.now(timezone.utc)
@@ -250,16 +356,16 @@ async def receipt_photo(update,c):
         c.user_data["pending_receipt_file_id"]=update.message.photo[-1].file_id
         kb=InlineKeyboardMarkup([[InlineKeyboardButton(t.title[:55],callback_data=f"receipttrip:{t.id}")] for _,t in rows])
         await update.message.reply_text("این رسید مربوط به کدام سفر است؟",reply_markup=kb);return
-    tid=int(c.user_data.pop("receipt_trip_id",0) or rows[0][1].id)
+    tid=await canonical_trip_id(db,int(c.user_data.pop("receipt_trip_id",0) or rows[0][1].id))
     await save_and_forward_receipt(update,c,tid,update.message.photo[-1].file_id)
 
 async def receipt_trip_pick(update,c):
-    q=update.callback_query;tid=int(q.data.split(":")[1]);file_id=c.user_data.pop("pending_receipt_file_id",None)
+    q=update.callback_query;tid=await canonical_trip_id(c.application.bot_data["db"],int(q.data.split(":")[1]));file_id=c.user_data.pop("pending_receipt_file_id",None)
     if not file_id:await q.answer("رسید پیدا نشد؛ دوباره عکس را بفرست.",show_alert=True);return
     await q.answer();await save_and_forward_receipt(update,c,tid,file_id)
 
 async def save_and_forward_receipt(update,c,tid,file_id):
-    uid=update.effective_user.id;db=c.application.bot_data["db"];t=await trip(db,tid)
+    uid=update.effective_user.id;db=c.application.bot_data["db"];tid=await canonical_trip_id(db,tid);t=await trip(db,tid)
     async with db.sessions() as ss:
         pb=(await ss.execute(select(Prebooking).where(Prebooking.trip_id==tid,Prebooking.telegram_id==uid,Prebooking.status=="prebooked"))).scalar_one_or_none()
         u=(await ss.execute(select(User).where(User.telegram_id==uid))).scalar_one_or_none()
@@ -302,7 +408,7 @@ async def receipt_review(update,c):
 async def export_confirmed(update,c):
     q=update.callback_query
     if not admin(q.from_user.id,c):return
-    await q.answer();tid=int(q.data.split(":")[2]);db=c.application.bot_data["db"];t=await trip(db,tid)
+    await q.answer();db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(q.data.split(":")[2]));t=await trip(db,tid)
     async with db.sessions() as ss:
         rows=(await ss.execute(select(Prebooking,User).join(User,User.telegram_id==Prebooking.telegram_id).where(
             Prebooking.trip_id==tid,Prebooking.status=="confirmed").order_by(Prebooking.updated_at))).all()
@@ -406,7 +512,7 @@ async def calendar_cb(update,c):
     await q.answer()
     z=q.data.split(":");act=z[1]
     if act=="none":return
-    tid=int(z[2]);kind=z[3]
+    tid=await canonical_trip_id(c.application.bot_data["db"],int(z[2]));kind=z[3]
     if act=="cancel":
         await q.edit_message_text("❌ انتخاب تاریخ لغو شد.");return
     if act=="nav":
@@ -449,7 +555,7 @@ def akb(tid,x):
 async def panel(update,c):
     q=update.callback_query
     if not admin(q.from_user.id,c):return
-    await q.answer();tid=int(q.data.split(":")[-1]);db=c.application.bot_data["db"];x=await cfg(db,tid,True);t=await trip(db,tid);a,w=await counts(db,tid)
+    await q.answer();db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(q.data.split(":")[-1]));x=await cfg(db,tid,True);t=await trip(db,tid);a,w=await counts(db,tid)
     await q.message.reply_text(f"🎟 تنظیمات پیش‌رزرو — {t.title}\n\nوضعیت: {'فعال' if x.enabled else 'غیرفعال'}\nظرفیت: {x.capacity} | ثبت: {a} | انتظار: {w}\nقیمت: {money(x.regular_price)}\nتخفیف: {money(x.early_discount)}\nمهلت: {fdt(x.deadline_at)}\nاجرای سفر: {fdt(x.execution_at)}\nشروع بازه جریمه: {fdt(x.cancel_from_at)}\nجریمه: {x.cancel_points} امتیاز",reply_markup=akb(tid,x))
 
 async def register_prebooking_group(update,c):
@@ -484,7 +590,7 @@ async def publication_picker(q,c,tid):
 async def publication_cb(update,c):
     q=update.callback_query
     if not admin(q.from_user.id,c):return
-    await q.answer();z=q.data.split(":");act=z[1];tid=int(z[2]);db=c.application.bot_data["db"]
+    await q.answer();z=q.data.split(":");act=z[1];db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(z[2]))
     if act=="toggle":
         chat_id=int(z[3])
         async with db.sessions() as ss:
@@ -547,7 +653,7 @@ async def _publication_keyboard(db,tid):
 async def action(update,c):
     q=update.callback_query
     if not admin(q.from_user.id,c):return ConversationHandler.END
-    await q.answer();_,a,tid=q.data.split(":");tid=int(tid);db=c.application.bot_data["db"];x=await cfg(db,tid,True)
+    await q.answer();_,a,tid=q.data.split(":");db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(tid));x=await cfg(db,tid,True)
     if a in ("toggle","wait","names"):
         async with db.sessions() as s:
             z=(await s.execute(select(PrebookingSettings).where(PrebookingSettings.trip_id==tid))).scalar_one()
@@ -629,13 +735,13 @@ async def mine(update,c):
 async def preadd_start(update,c):
     q=update.callback_query
     if not admin(q.from_user.id,c):return
-    await q.answer();tid=int(q.data.split(":")[2])
+    await q.answer();tid=await canonical_trip_id(c.application.bot_data["db"],int(q.data.split(":")[2]))
     c.user_data["preadd_tid"]=tid;c.user_data["preadd_waiting"]=True
     await q.message.reply_text("🔎 نام، شماره موبایل، KZH، BTC یا Telegram ID مسافر را وارد کن:")
 
 async def preadd_search(update,c):
     if update.effective_chat.type != "private" or not admin(update.effective_user.id,c) or not c.user_data.get("preadd_waiting"):return
-    value=(update.message.text or "").strip();db=c.application.bot_data["db"];tid=int(c.user_data["preadd_tid"])
+    value=(update.message.text or "").strip();db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(c.user_data["preadd_tid"]))
     users=await db.search_users(value,limit=10)
     if not users:
         await update.message.reply_text("مسافری پیدا نشد. دوباره جستجو کن.");return
@@ -646,7 +752,7 @@ async def preadd_search(update,c):
 async def preadd_cb(update,c):
     q=update.callback_query
     if not admin(q.from_user.id,c):return
-    await q.answer();z=q.data.split(":");act=z[1];tid=int(z[2]);db=c.application.bot_data["db"]
+    await q.answer();z=q.data.split(":");act=z[1];db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(z[2]))
     if act=="cancel":
         c.user_data.pop("preadd_waiting",None);c.user_data.pop("preadd_tid",None);await q.edit_message_text("لغو شد.");return
     uid=int(z[3])
@@ -673,7 +779,7 @@ async def preadd_cb(update,c):
 async def preperson_cb(update,c):
     q=update.callback_query
     if not admin(q.from_user.id,c):return
-    await q.answer();z=q.data.split(":");tid=int(z[2]);uid=int(z[3]);db=c.application.bot_data["db"];u=await db.get_user(uid)
+    await q.answer();z=q.data.split(":");db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(z[2]));uid=int(z[3]);u=await db.get_user(uid)
     await q.message.reply_text(f"👤 {u.full_name}\nوضعیت جدید:",reply_markup=InlineKeyboardMarkup([
       [InlineKeyboardButton("🟡 پیش‌رزرو",callback_data=f"padd:set:{tid}:{uid}:prebooked"),InlineKeyboardButton("🟢 قطعی",callback_data=f"padd:set:{tid}:{uid}:confirmed")],
       [InlineKeyboardButton("⏳ انتظار",callback_data=f"padd:set:{tid}:{uid}:waitlist"),InlineKeyboardButton("⚪ لغو",callback_data=f"padd:set:{tid}:{uid}:cancelled")]]))
@@ -740,6 +846,7 @@ async def initialize_prebooking(app):
             WHERE chat_id IS NOT NULL AND message_id IS NOT NULL
             ON CONFLICT (trip_id, chat_id) DO NOTHING
         """))
+    await repair_merged_prebookings(app)
     asyncio.create_task(loop(app))
 
 async def profile_prebookings(update,c):
@@ -773,7 +880,7 @@ async def profile_prebookings(update,c):
 
 async def profile_prebooking_cb(update,c):
     q=update.callback_query;await q.answer()
-    z=q.data.split(":");act=z[1];tid=int(z[2]);uid=q.from_user.id;db=c.application.bot_data["db"]
+    z=q.data.split(":");act=z[1];uid=q.from_user.id;db=c.application.bot_data["db"];tid=await canonical_trip_id(db,int(z[2]))
     async with db.sessions() as ss:
         pb=(await ss.execute(select(Prebooking).where(Prebooking.trip_id==tid,Prebooking.telegram_id==uid))).scalar_one_or_none()
         t=(await ss.execute(select(Trip).where(Trip.id==tid))).scalar_one_or_none()
