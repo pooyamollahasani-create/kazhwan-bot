@@ -71,6 +71,7 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("👥 اعضا", callback_data="admin:members"),
         ],
         [InlineKeyboardButton("📋 مدیریت همه سفرها", callback_data="admin:trips")],
+        [InlineKeyboardButton("👑 مدیریت مدیران (فقط مالک)", callback_data="staff:home")],
         [InlineKeyboardButton("🔕 مدیریت ساعت سکوت", callback_data="admin:quiet")],
         [
             InlineKeyboardButton("⏳ غیرفعال ۳۰ روز", callback_data="admin:inactive30"),
@@ -1628,7 +1629,8 @@ async def trip_edit_fallback_input(update, context):
 
 
 def admin_handlers():
-    return [
+    from bot.handlers.staff_management import handlers as staff_handlers
+    return staff_handlers() + [
         build_admin_flow_handler(),
         build_quiet_settings_handler(),
         build_member_search_handler(),
