@@ -3,6 +3,7 @@ from telegram import BotCommandScopeAllChatAdministrators,BotCommandScopeAllGrou
 from telegram.ext import Application,ContextTypes
 from bot.config import load_settings
 from bot.db import Database
+from bot.handlers.staff_management import initialize_staff
 from bot.handlers.admin import admin_handlers
 from bot.handlers.menu import menu_handlers
 from bot.handlers.moderation import initialize_quiet_hours,moderation_handlers
@@ -23,7 +24,7 @@ async def error_handler(update:object,context:ContextTypes.DEFAULT_TYPE)->None:
  logger.exception("Unhandled error",exc_info=context.error)
  if isinstance(update,Update) and update.effective_message and update.effective_chat and update.effective_chat.type=="private":await update.effective_message.reply_text("یک خطای موقت پیش آمد. لطفاً دوباره تلاش کنید.")
 async def post_init(application:Application)->None:
- db=application.bot_data["db"];settings=application.bot_data["settings"];await db.init();await initialize_prebooking(application);await initialize_quiet_hours(application)
+ db=application.bot_data["db"];settings=application.bot_data["settings"];await db.init();await initialize_staff(application);await initialize_prebooking(application);await initialize_quiet_hours(application)
  private_user_commands=[("start","شروع و تکمیل پروفایل کژوان")]
  group_user_commands=[("tripinfo","اطلاعات سفر این گروه")]
  group_admin_commands=[("settrip","تعریف یا ویرایش سفر این گروه"),("tripinfo","اطلاعات سفر این گروه"),("tripregister","انتشار دکمه ثبت سفر برای مسافران"),("chatid","نمایش شناسه عددی گروه"),("quieton","بستن دستی چت گروه"),("quietoff","باز کردن دستی چت گروه"),("prebookinggroup","افزودن گروه به مقصدهای پیش‌رزرو"),("cancel","توقف فرآیند جاری")]
