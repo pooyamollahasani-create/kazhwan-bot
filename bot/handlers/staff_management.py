@@ -237,6 +237,33 @@ async def confirm(update, context):
     else:
         settings.admin_ids.discard(tid)
     await update.callback_query.message.reply_text("✅ دسترسی مدیریتی فعال شد." if mode == "add" else "✅ دسترسی مدیریتی لغو شد.", reply_markup=menu())
+    # Telegram's private command menu is scoped per user, not automatically
+    # updated when the in-memory admin set changes.
+    try:
+        from telegram import BotCommandScopeChat
+        scope = BotCommandScopeChat(chat_id=tid)
+        if mode == "add":
+            commands = [
+                ("start", "شروع و تکمیل پروفایل کژوان"),
+                ("admin", "پنل مدیریت"),
+                ("broadcast", "ارسال پیام همگانی"),
+                ("stats", "آمار مدیریتی"),
+                ("members", "تعداد اعضای ثبت‌شده"),
+                ("member", "جستجوی عضو"),
+                ("inactive30", "غیرفعال بیش از ۳۰ روز"),
+                ("inactive60", "غیرفعال بیش از ۶۰ روز"),
+                ("topreferrals", "معرف‌های برتر"),
+                ("exportmembers", "خروجی Excel اعضا"),
+                ("exportinactive", "خروجی Excel غیرفعال‌ها"),
+                ("exportreferrals", "خروجی Excel معرف‌ها"),
+                ("exportall", "خروجی کامل مدیریتی"),
+                ("cancel", "توقف فرآیند جاری"),
+            ]
+            await context.bot.set_my_commands(commands, scope=scope)
+        else:
+            await context.bot.delete_my_commands(scope=scope)
+    except Exception:
+        log.exception("Could not update Telegram command menu for staff %s", tid)
     try:
         await context.bot.send_message(tid, "🛡 دسترسی مدیریتی شما در ربات کژوان فعال شد." if mode == "add" else "دسترسی مدیریتی شما در ربات کژوان لغو شد.")
     except Exception:
