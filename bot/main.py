@@ -3,7 +3,7 @@ from telegram import BotCommandScopeAllChatAdministrators,BotCommandScopeAllGrou
 from telegram.ext import Application,ContextTypes
 from bot.config import load_settings
 from bot.db import Database
-from bot.handlers.staff_management import initialize_staff
+from bot.handlers.staff_management import initialize_staff, handlers as staff_handlers
 from bot.handlers.admin import admin_handlers
 from bot.handlers.menu import menu_handlers
 from bot.handlers.moderation import initialize_quiet_hours,moderation_handlers
@@ -41,7 +41,7 @@ async def _post(app):
  await post_init(app)
 def main():
  settings=load_settings();db=Database(settings.database_url);app=Application.builder().token(settings.bot_token).concurrent_updates(False).post_init(_post).build();app.bot_data["settings"]=settings;app.bot_data["db"]=db
- app.add_handler(build_onboarding_handler(),group=0);app.add_handlers(prebooking_handlers(),group=1);app.add_handlers(menu_handlers(),group=2);app.add_handlers(admin_handlers(),group=3);app.add_handlers(trip_handlers(),group=4);app.add_handlers(feedback_handlers(),group=5);app.add_handlers(broadcast_handlers(),group=6)
+ app.add_handler(build_onboarding_handler(),group=0);app.add_handlers(prebooking_handlers(),group=1);app.add_handlers(menu_handlers(),group=2);app.add_handlers(admin_handlers(),group=3);app.add_handlers(trip_handlers(),group=4);app.add_handlers(feedback_handlers(),group=5);app.add_handlers(broadcast_handlers(),group=6);app.add_handlers(staff_handlers(),group=7)
  for h in moderation_handlers():app.add_handler(h,group=10)
  app.add_error_handler(error_handler);logger.info("Kazhwan bot v1.12 is running...");app.run_polling(allowed_updates=Update.ALL_TYPES)
 if __name__=="__main__":main()
